@@ -2,6 +2,35 @@
 
 This bundle contains the Ansible playbooks and tuning files used for the lab runs in the paper.
 
+## WSL2 Ubuntu host setup
+
+These playbooks were written for a controller running inside Ubuntu on WSL2, with VirtualBox installed on the Windows host.
+
+On Windows, install WSL and Ubuntu if you have not already:
+
+```powershell
+wsl --install -d Ubuntu
+```
+
+After rebooting and completing the Ubuntu first-run setup, open the Ubuntu shell and create the expected controller path:
+
+```bash
+mkdir -p /home/ubuntu
+cd /home/ubuntu
+git clone https://github.com/kalydeio-jzderadicka/ise5901-lab.git
+cd ise5901-lab
+```
+
+If your WSL username is not `ubuntu`, either clone the repo to `/home/ubuntu/ise5901-lab` anyway or update the hard-coded playbook paths to match your actual home directory.
+
+Verify that WSL can see the Windows-side VirtualBox install used by the VM control playbooks:
+
+```bash
+ls "/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe"
+```
+
+If that path does not exist, install VirtualBox on Windows or adjust the `vboxmanage` path in the boot and snapshot playbooks.
+
 ## Controller requirements
 
 Install these packages on the machine where you run Ansible:
