@@ -1,7 +1,6 @@
 .vault_pass
 inventory.yaml
-.env
-.env.*
+.venv/
 *.retry
 __pycache__/
 *.py[cod]

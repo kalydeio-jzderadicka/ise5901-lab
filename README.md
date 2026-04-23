@@ -2,6 +2,37 @@
 
 This bundle contains the Ansible playbooks and tuning files used for the lab runs in the paper.
 
+## Controller requirements
+
+Install these packages on the machine where you run Ansible:
+
+- `git`
+- `openssh-client`
+- `python3`
+- `python3-venv`
+- `ansible-core` 2.15 or newer
+
+Ubuntu example:
+
+```bash
+sudo apt update
+sudo apt install -y git openssh-client python3 python3-venv
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install "ansible-core>=2.15,<2.18"
+```
+
+Verify the install:
+
+```bash
+source .venv/bin/activate
+ansible --version
+ansible-playbook --version
+```
+
+This bundle uses built-in Ansible modules only, so no separate `collections/requirements.yml` file is required.
+
 ## What is included
 
 - `playbooks/` for lab bootstrapping, preflight checks, tuning deployment, single Empire runs, single Sliver runs, and RITA post-run analysis.
@@ -21,9 +52,18 @@ This bundle preserves the original lab pathing and host layout.
 ## Setup
 
 1. Place the bundle at `/home/ubuntu/ise5901-lab` or adjust the playbooks to match your local pathing.
-2. Edit `inventory.yaml.example` with your real SSH key path, usernames, and host IPs.
-3. Create `.vault_pass` in the bundle root if you use the bundled `ansible.cfg` vault setting.
-4. Provide `vault_become_password` through Ansible Vault or another override mechanism.
+2. Create and activate the local virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install "ansible-core>=2.15,<2.18"
+```
+
+3. Copy `inventory.yaml.example` to `inventory.yaml` and update it with your real SSH key path, usernames, and host IPs.
+4. Create `.vault_pass` in the bundle root if you use the bundled `ansible.cfg` vault setting.
+5. Provide `vault_become_password` through Ansible Vault or another override mechanism.
 
 ## Typical usage
 
