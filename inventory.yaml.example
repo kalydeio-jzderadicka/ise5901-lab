@@ -1,0 +1,63 @@
+all:
+  vars:
+    ansible_user: labadmin
+    ansible_ssh_private_key_file: ~/.ssh/your_lab_key
+    ansible_python_interpreter: /usr/bin/python3
+    # Define vault_become_password in group_vars/all/vault.yml or override at runtime.
+    ansible_become_password: "{{ vault_become_password }}"
+
+  children:
+    attackers:
+      hosts:
+        atk-kali-01:
+          ansible_host: 172.16.10.10
+
+    victims_linux:
+      hosts:
+        vic-lnx-01:
+          ansible_host: 172.16.20.11
+          ansible_user: labuser
+
+    victims_windows:
+      hosts:
+        vic-win-01:
+          ansible_host: 172.16.20.10
+          ansible_connection: ssh
+          ansible_shell_type: powershell
+          ansible_user: labuser
+          ansible_ssh_private_key_file: ~/.ssh/your_lab_key
+          ansible_ssh_common_args: '-o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ConnectTimeout=30'
+          ansible_command_timeout: 60
+
+    sensors:
+      children:
+        sensor_zeek:
+          hosts:
+            mon-zeek-01:
+              ansible_host: 172.16.30.11
+        sensor_suricata:
+          hosts:
+            mon-suricata-01:
+              ansible_host: 172.16.30.12
+        sensor_seconion:
+          hosts:
+            mon-seconion-01:
+              ansible_host: 172.16.30.10
+              ansible_user: soadmin
+        sensor_rita:
+          hosts:
+            mon-rita-01:
+              ansible_host: 172.16.30.13
+
+    linux_all:
+      children:
+        attackers:
+        victims_linux:
+        sensor_zeek:
+        sensor_suricata:
+        sensor_rita:
+        sensor_seconion:
+
+    windows_all:
+      children:
+        victims_windows:

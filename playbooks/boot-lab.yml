@@ -1,0 +1,106 @@
+---
+# playbooks/boot-lab.yml — Boot all lab VMs and wait for SSH connectivity
+#
+# Usage:
+#   ansible-playbook -i inventory.yml playbooks/boot-lab.yml
+#   ansible-playbook -i inventory.yml playbooks/boot-lab.yml -e "boot_targets=sensors"
+#   ansible-playbook -i inventory.yml playbooks/boot-lab.yml -e "boot_targets=victims"
+#
+# Modes:
+#   all      — boot every VM (default)
+#   sensors  — sensors + attacker only (victims handled by reset-victims.yml per run)
+#   victims  — victims only
+#
+# All VMs are started without snapshot revert (persistent state).
+# Use reset-victims.yml to revert victims to C2-Ready before a run.
+# Manage the C2-Ready snapshot outside this trimmed bundle.
+
+- name: "Boot lab VMs — {{ boot_targets | default('all') }}"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars:
+    vboxmanage: '/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe'
+    boot_targets: all
+    boot_wait: 90
+    victim_snapshot: "{{ reset_snapshot | default('C2-Ready') }}"
+
+    vm_map:
+      atk-kali-01:
+        vmname: ATK-KALI-01
+        ip: 172.16.10.10
+        group: infra
+      mon-seconion-01:
+        vmname: MON-SECONION-01
+        ip: 172.16.30.10
+        group: sensors
+      mon-zeek-01:
+        vmname: MON-ZEEK-01
+        ip: 172.16.30.11
+        group: sensors
+      mon-suricata-01:
+        vmname: MON-SURICATA-01
+        ip: 172.16.30.12
+        group: sensors
+      mon-rita-01:
+        vmname: MON-RITA-01
+        ip: 172.16.30.13
+        group: sensors
+      vic-win-01:
+        vmname: VIC-WIN-01
+        ip: 172.16.20.10
+        group: victims
+      vic-lnx-01:
+        vmname: VIC-LNX-01
+        ip: 172.16.20.11
+        group: victims
+
+  tasks:
+    # ── Build target list based on boot_targets ──
+    - name: Build full VM name list
+      set_fact:
+        _all_vms: "{{ vm_map.keys() | list }}"
+        _sensor_vms: "{{ vm_map | dict2items | selectattr('value.group', 'in', ['infra', 'sensors']) | map(attribute='key') | list }}"
+        _victim_vms: "{{ vm_map | dict2items | selectattr('value.group', 'equalto', 'victims') | map(attribute='key') | list }}"
+
+    - name: Select targets for boot_targets={{ boot_targets }}
+      set_fact:
+        _targets: "{{ _all_vms if boot_targets == 'all' else (_sensor_vms if boot_targets == 'sensors' else _victim_vms) }}"
+
+    - name: Show targets
+      debug:
+        msg: "Booting {{ _targets | length }} VMs: {{ _targets | join(', ') }}"
+
+    # ── Start all target VMs ──
+    - name: Start VMs
+      command: >
+        "{{ vboxmanage }}" startvm "{{ vm_map[item].vmname }}" --type headless
+      loop: "{{ _targets }}"
+      register: start_results
+      failed_when: false
+
+    - name: Report start results
+      debug:
+        msg: "{{ item.item }}: {{ 'started' if item.rc == 0 else 'already running or error (rc=' ~ item.rc ~ ')' }}"
+      loop: "{{ start_results.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # ── Wait for boot ──
+    - name: "Wait {{ boot_wait }}s for VMs to initialize"
+      pause:
+        seconds: "{{ boot_wait }}"
+
+    # ── Wait for SSH on all targets ──
+    - name: Wait for SSH connectivity
+      wait_for:
+        host: "{{ vm_map[item].ip }}"
+        port: 22
+        delay: 5
+        timeout: 180
+      loop: "{{ _targets }}"
+      register: ssh_results
+
+    - name: All VMs reachable
+      debug:
+        msg: "{{ _targets | length }} VMs booted and SSH ready"

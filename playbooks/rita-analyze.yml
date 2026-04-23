@@ -1,0 +1,124 @@
+---
+# playbooks/rita-analyze.yml — Import Zeek logs into RITA and run beacon analysis
+#
+# Imports collected Zeek logs from a completed run into RITA on mon-rita-01,
+# runs beacon analysis, exports results to CSV, and fetches them back.
+#
+# Usage:
+#   ansible-playbook -i inventory.yml playbooks/rita-analyze.yml \
+#     -e "run_id=EMP-HTTP-WIN-TUN-01"
+#
+# Required extra vars:
+#   run_id — The completed run to analyze (must have zeek/ artifacts in runs/)
+#
+# Can be run against both default and tuned runs for comparison.
+
+- name: "RITA beacon analysis — {{ run_id }}"
+  hosts: sensor_rita
+  become: yes
+  gather_facts: no
+  vars:
+    _run_dir: "/home/ubuntu/ise5901-lab/runs/{{ run_id }}"
+    _remote_log_dir: "/home/labadmin/ise5901/zeek-logs/{{ run_id }}"
+    _remote_result_dir: "/home/labadmin/ise5901/rita-results/{{ run_id }}"
+    _db_name: "{{ run_id | lower | regex_replace('-', '_') }}"
+  tasks:
+
+    # ── Verify Zeek logs exist locally ───────────────────────────
+    - name: Check for Zeek log archive in run directory
+      delegate_to: localhost
+      connection: local
+      become: no
+      stat:
+        path: "{{ _run_dir }}/zeek/zeek-{{ run_id }}.tar.gz"
+      register: zeek_archive
+
+    - name: Fail if Zeek logs not collected
+      fail:
+        msg: >-
+          No Zeek log archive found at {{ _run_dir }}/zeek/zeek-{{ run_id }}.tar.gz.
+          Run the experiment first to collect Zeek logs.
+      when: not zeek_archive.stat.exists
+
+    # ── Prepare remote directories ───────────────────────────────
+    - name: Create remote log directory
+      file:
+        path: "{{ _remote_log_dir }}"
+        state: directory
+        owner: labadmin
+        group: labadmin
+        mode: "0755"
+
+    - name: Create remote results directory
+      file:
+        path: "{{ _remote_result_dir }}"
+        state: directory
+        owner: labadmin
+        group: labadmin
+        mode: "0755"
+
+    # ── Upload and extract Zeek logs ─────────────────────────────
+    - name: Upload Zeek log archive to RITA host
+      copy:
+        src: "{{ _run_dir }}/zeek/zeek-{{ run_id }}.tar.gz"
+        dest: "{{ _remote_log_dir }}/zeek-{{ run_id }}.tar.gz"
+        owner: labadmin
+        group: labadmin
+
+    - name: Extract Zeek logs
+      unarchive:
+        src: "{{ _remote_log_dir }}/zeek-{{ run_id }}.tar.gz"
+        dest: "{{ _remote_log_dir }}/"
+        remote_src: yes
+
+    # ── Delete stale database if re-running ──────────────────────
+    - name: Remove existing RITA database (idempotent)
+      command: rita delete {{ _db_name }} --force
+      changed_when: true
+      ignore_errors: yes
+
+    # ── Import into RITA ─────────────────────────────────────────
+    - name: Import Zeek logs into RITA
+      command: rita import --database {{ _db_name }} {{ _remote_log_dir }}/
+      changed_when: true
+      register: rita_import
+
+    - debug:
+        msg: "RITA import: {{ rita_import.stdout_lines | default(['no output']) | join(' ') }}"
+
+    # ── Run beacon analysis ──────────────────────────────────────
+    - name: Run RITA beacon analysis
+      shell: rita show-beacons {{ _db_name }} --sort score --limit 50
+      changed_when: false
+      register: rita_beacons
+
+    - debug:
+        msg: "{{ rita_beacons.stdout_lines | default(['no beacons found']) }}"
+
+    # ── Export results to CSV ────────────────────────────────────
+    - name: Export beacon results to CSV
+      shell: >
+        rita show-beacons {{ _db_name }} --format csv
+        > {{ _remote_result_dir }}/beacons.csv
+      changed_when: true
+
+    # ── Fetch results back to controller ─────────────────────────
+    - name: Ensure local RITA results directory exists
+      delegate_to: localhost
+      connection: local
+      become: no
+      file:
+        path: "{{ _run_dir }}/rita"
+        state: directory
+
+    - name: Fetch beacon CSV
+      fetch:
+        src: "{{ _remote_result_dir }}/beacons.csv"
+        dest: "{{ _run_dir }}/rita/beacons.csv"
+        flat: yes
+
+    - debug:
+        msg: >-
+          RITA analysis complete for {{ run_id }}.
+          Results: {{ _run_dir }}/rita/beacons.csv
+          Database: {{ _db_name }}

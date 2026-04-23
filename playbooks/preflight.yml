@@ -1,0 +1,169 @@
+---
+- name: Preflight — Verify Attacker
+  hosts: attackers
+  become: yes
+  tasks:
+    - name: Check Sliver installed
+      command: which sliver-server
+      changed_when: false
+
+    - name: Check Empire installed
+      command: which powershell-empire
+      changed_when: false
+
+    - name: Check working directories exist
+      stat:
+        path: /home/labadmin/ise5901
+      register: workdir
+    - assert:
+        that: workdir.stat.isdir
+
+    - name: Verify static IP
+      command: ip -4 addr show
+      register: ip_out
+      changed_when: false
+    - assert:
+        that: "'172.16.10.10' in ip_out.stdout"
+
+- name: Preflight — Verify Zeek Sensor
+  hosts: sensor_zeek
+  become: yes
+  tasks:
+    - name: Check Zeek is installed
+      stat:
+        path: /opt/zeek/bin/zeekctl
+      register: zeekctl_bin
+
+    - assert:
+        that: zeekctl_bin.stat.exists
+        fail_msg: "Zeek is not installed at /opt/zeek/bin/zeekctl"
+
+    - name: Check Zeek configuration
+      command: /opt/zeek/bin/zeekctl check
+      changed_when: false
+
+    - name: Deploy Zeek and verify it stays running
+      shell: |
+        /opt/zeek/bin/zeekctl deploy
+        sleep 5
+        /opt/zeek/bin/zeekctl status
+      register: zeek_deploy_status
+      changed_when: true
+      failed_when: false
+      retries: 8
+      delay: 15
+      until:
+        - zeek_deploy_status.rc == 0
+        - "'running' in zeek_deploy_status.stdout"
+
+    - name: Display Zeek deploy+status stdout
+      debug:
+        var: zeek_deploy_status.stdout_lines
+
+    - name: Display Zeek deploy+status stderr
+      debug:
+        var: zeek_deploy_status.stderr_lines
+
+    - name: Display Zeek deploy+status return code
+      debug:
+        var: zeek_deploy_status.rc
+
+    - name: Assert Zeek is running
+      assert:
+        that:
+          - zeek_deploy_status.rc == 0
+          - "'running' in zeek_deploy_status.stdout"
+        fail_msg: "Zeek failed to stay running after deploy"
+
+- name: Preflight — Verify Suricata Sensor
+  hosts: sensor_suricata
+  become: yes
+  tasks:
+    - name: Check Suricata installed
+      shell: which suricata || test -x /usr/bin/suricata || test -x /usr/local/bin/suricata
+      changed_when: false
+
+    - name: Check Suricata is running
+      shell: systemctl is-active suricata || pgrep -x suricata
+      changed_when: false
+
+- name: Preflight — Verify RITA
+  hosts: sensor_rita
+  become: yes
+  tasks:
+    - name: Check Docker is installed
+      command: docker --version
+      changed_when: false
+
+    - name: Check ClickHouse container is running
+      shell: docker ps | grep -q clickhouse
+      changed_when: false
+
+    - name: Check syslog-ng container is running
+      shell: docker ps | grep -q syslog-ng
+      changed_when: false
+
+- name: Preflight — Verify Windows Victim
+  hosts: victims_windows
+  gather_facts: false
+  tasks:
+    - name: Verify SSH connectivity
+      raw: whoami
+      changed_when: false
+
+    - name: Verify static IP
+      raw: powershell -Command "Get-NetIPAddress -InterfaceAlias 'Ethernet*' | Select-Object -ExpandProperty IPAddress"
+      register: ip_out
+      changed_when: false
+    - assert:
+        that: "'172.16.20.10' in ip_out.stdout"
+
+    - name: Check Windows Firewall allows attacker subnet
+      raw: powershell -Command "Get-NetFirewallRule | Where-Object { $_.Enabled -eq 'True' } | Measure-Object | Select-Object -ExpandProperty Count"
+      changed_when: false
+
+- name: Preflight — Verify Security Onion
+  hosts: sensor_seconion
+  become: yes
+  vars:
+    ansible_user: soadmin
+  tasks:
+    - name: Verify SSH connectivity
+      command: hostname
+      changed_when: false
+
+    - name: Verify static IP
+      command: ip -4 addr show
+      register: ip_out
+      changed_when: false
+    - assert:
+        that: "'172.16.30.10' in ip_out.stdout"
+
+    - name: Wait for SO status to become ready
+      command: sudo so-status
+      changed_when: false
+      failed_when: false
+      register: so_status
+      retries: 30
+      delay: 60
+      until: so_status.rc == 0
+
+    - name: Display SO status
+      debug:
+        var: so_status.stdout_lines
+
+    - name: Assert SO status succeeded
+      assert:
+        that:
+          - so_status.rc == 0
+        fail_msg: "Security Onion did not finish starting before the retry window expired"
+
+- name: Preflight — Verify Linux Victim
+  hosts: victims_linux
+  tasks:
+    - name: Verify static IP
+      command: ip -4 addr show
+      register: ip_out
+      changed_when: false
+    - assert:
+        that: "'172.16.20.11' in ip_out.stdout"

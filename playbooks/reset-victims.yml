@@ -1,0 +1,70 @@
+---
+# playbooks/reset-victims.yml — Revert victim VMs to a snapshot and wait for SSH
+#
+# Usage:
+#   ansible-playbook -i inventory.yml playbooks/reset-victims.yml
+#   ansible-playbook -i inventory.yml playbooks/reset-victims.yml -e "reset_snapshot=C2-Ready"
+#   ansible-playbook -i inventory.yml playbooks/reset-victims.yml -e "reset_targets=vic-win-01"
+#
+# Defaults: reverts both victims to C2-Ready, waits for SSH.
+
+- name: "Reset victims — revert to {{ reset_snapshot | default('C2-Ready') }}"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars:
+    vboxmanage: '/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe'
+    _snapshot: "{{ reset_snapshot | default('C2-Ready') }}"
+    _targets_raw: "{{ reset_targets | default('both') }}"
+    boot_wait: 60
+    vm_map:
+      vic-win-01:
+        vmname: VIC-WIN-01
+        ip: 172.16.20.10
+      vic-lnx-01:
+        vmname: VIC-LNX-01
+        ip: 172.16.20.11
+  tasks:
+    - name: Build target list
+      set_fact:
+        _targets: >-
+          {{ ['vic-win-01', 'vic-lnx-01'] if _targets_raw == 'both'
+             else [_targets_raw] if _targets_raw is string
+             else _targets_raw }}
+
+    - name: Power off VMs before restore
+      command: >
+        "{{ vboxmanage }}" controlvm "{{ vm_map[item].vmname }}" poweroff
+      loop: "{{ _targets }}"
+      ignore_errors: yes
+
+    - name: Revert VMs to snapshot
+      command: >
+        "{{ vboxmanage }}" snapshot "{{ vm_map[item].vmname }}" restore "{{ _snapshot }}"
+      loop: "{{ _targets }}"
+
+    - name: Discard any saved state after revert
+      command: >
+        "{{ vboxmanage }}" discardstate "{{ vm_map[item].vmname }}"
+      loop: "{{ _targets }}"
+      ignore_errors: yes
+
+    - name: Start VMs after revert
+      command: >
+        "{{ vboxmanage }}" startvm "{{ vm_map[item].vmname }}" --type headless
+      loop: "{{ _targets }}"
+
+    - name: Wait for VMs to boot
+      pause:
+        seconds: "{{ boot_wait }}"
+
+    - name: Wait for SSH on victims
+      wait_for:
+        host: "{{ vm_map[item].ip }}"
+        port: 22
+        delay: 5
+        timeout: 120
+      loop: "{{ _targets }}"
+
+    - debug:
+        msg: "{{ _targets | join(', ') }} reverted to {{ _snapshot }} and SSH ready"

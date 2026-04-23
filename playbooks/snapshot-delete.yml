@@ -1,0 +1,51 @@
+---
+# playbooks/snapshot-delete.yml — Delete a named snapshot from all lab VMs
+#
+# Usage:
+#   ansible-playbook -i inventory.yml playbooks/snapshot-delete.yml
+#   ansible-playbook -i inventory.yml playbooks/snapshot-delete.yml -e "snap_name=C2-Ready"
+#
+# WARNING: This permanently removes the snapshot. Run snapshot-create.yml
+#          to create a fresh one once the VMs are in the desired state.
+
+- name: "Delete snapshot '{{ snap_name | default('C2-Ready') }}' from all lab VMs"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  any_errors_fatal: true
+  vars:
+    vboxmanage: '/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe'
+    snap_name: "C2-Ready"
+    vm_map:
+      atk-kali-01:
+        vmname: ATK-KALI-01
+      vic-win-01:
+        vmname: VIC-WIN-01
+      vic-lnx-01:
+        vmname: VIC-LNX-01
+      mon-seconion-01:
+        vmname: MON-SECONION-01
+      mon-zeek-01:
+        vmname: MON-ZEEK-01
+      mon-suricata-01:
+        vmname: MON-SURICATA-01
+      mon-rita-01:
+        vmname: MON-RITA-01
+
+  tasks:
+    - name: Confirm targets
+      debug:
+        msg: "Deleting snapshot '{{ snap_name }}' from: {{ vm_map.keys() | list | join(', ') }}"
+
+    - name: Delete snapshot
+      command: >
+        "{{ vboxmanage }}" snapshot "{{ vm_map[item].vmname }}" delete "{{ snap_name }}"
+      loop: "{{ vm_map.keys() | list }}"
+      register: delete_results
+
+    - name: Report results
+      debug:
+        msg: "{{ item.item }}: snapshot '{{ snap_name }}' deleted"
+      loop: "{{ delete_results.results }}"
+      loop_control:
+        label: "{{ item.item }}"

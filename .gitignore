@@ -1,0 +1,10 @@
+.vault_pass
+inventory.yaml
+.env
+.env.*
+*.retry
+__pycache__/
+*.py[cod]
+.DS_Store
+.vscode/
+.idea/

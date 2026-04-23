@@ -1,0 +1,99 @@
+---
+# preflight-sensors.yml — Verify sensors are actively logging
+# Run after preflight.yml to confirm log pipelines are hot.
+
+- name: Verify Zeek is actively logging
+  hosts: sensor_zeek
+  become: yes
+  tasks:
+    - name: Check Zeek is running
+      command: /opt/zeek/bin/zeekctl status
+      changed_when: false
+      register: zeek_status
+
+    - assert:
+        that: "'running' in zeek_status.stdout"
+        fail_msg: "Zeek is not running — run 'zeekctl deploy' first"
+
+    - name: Wait for conn.log to appear
+      shell: test -f /opt/zeek/logs/current/conn.log
+      register: conn_exists
+      retries: 12
+      delay: 10
+      until: conn_exists.rc == 0
+      changed_when: false
+
+    - name: Verify conn.log was written recently
+      shell: |
+        LOG=/opt/zeek/logs/current/conn.log
+        AGE=$(( $(date +%s) - $(stat -c %Y "$LOG") ))
+        if [ $AGE -gt 300 ]; then
+          echo "STALE ($AGE seconds old)"
+          exit 1
+        fi
+        echo "OK ($AGE seconds old, $(wc -l < "$LOG") lines)"
+      changed_when: false
+      register: conn_log_check
+
+    - debug:
+        msg: "{{ conn_log_check.stdout }}"
+
+- name: Verify Suricata is actively logging
+  hosts: sensor_suricata
+  become: yes
+  tasks:
+    - name: Check Suricata service is active
+      command: systemctl is-active suricata
+      changed_when: false
+      register: suri_status
+
+    - assert:
+        that: "suri_status.stdout == 'active'"
+        fail_msg: "Suricata is not running"
+
+    - name: Verify eve.json exists and is recent
+      shell: |
+        LOG=/var/log/suricata/eve.json
+        if [ ! -f "$LOG" ]; then echo "MISSING"; exit 1; fi
+        AGE=$(( $(date +%s) - $(stat -c %Y "$LOG") ))
+        if [ $AGE -gt 300 ]; then echo "STALE ($AGE seconds old)"; exit 1; fi
+        LINES=$(wc -l < "$LOG")
+        echo "OK ($AGE seconds old, $LINES events)"
+      changed_when: false
+      register: eve_check
+
+    - debug:
+        msg: "{{ eve_check.stdout }}"
+
+    - name: Verify fast.log exists
+      stat:
+        path: /var/log/suricata/fast.log
+      register: fast_log
+
+    - assert:
+        that: fast_log.stat.exists
+        fail_msg: "fast.log not found"
+
+- name: Verify Security Onion is healthy
+  hosts: sensor_seconion
+  become: yes
+  vars:
+    ansible_user: soadmin
+  tasks:
+    - name: Run so-status and check for failures
+      shell: sudo so-status 2>&1
+      changed_when: false
+      register: so_status
+
+    - name: Display SO status
+      debug:
+        var: so_status.stdout_lines
+
+    - name: Fail if any container is not running
+      shell: sudo so-status 2>&1 | grep -i 'not running\|error\|failed' || true
+      changed_when: false
+      register: so_errors
+
+    - assert:
+        that: so_errors.stdout == ""
+        fail_msg: "Security Onion has unhealthy containers: {{ so_errors.stdout }}"

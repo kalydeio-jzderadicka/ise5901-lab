@@ -1,0 +1,120 @@
+---
+# playbooks/snapshot-create.yml — Create a named snapshot on all lab VMs
+#
+# Usage:
+#   ansible-playbook -i inventory.yml playbooks/snapshot-create.yml
+#   ansible-playbook -i inventory.yml playbooks/snapshot-create.yml -e "snap_name=C2-Ready"
+#
+# What it does:
+#   1. Powers off each VM cleanly (acpipowerbutton, ignores errors)
+#   2. Takes a snapshot at the powered-off state
+#   3. Starts the VMs headless
+#   4. Waits for SSH connectivity on Linux/SSH VMs
+#
+# Run this only when all VMs are in the correct baseline state.
+
+- name: "Create snapshot '{{ snap_name | default('C2-Ready') }}' on all lab VMs"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  any_errors_fatal: true
+  vars:
+    vboxmanage: '/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe'
+    snap_name: "C2-Ready"
+    boot_wait: 60
+    vm_map:
+      atk-kali-01:
+        vmname: ATK-KALI-01
+        ip: 172.16.10.10
+      vic-win-01:
+        vmname: VIC-WIN-01
+        ip: 172.16.20.10
+      vic-lnx-01:
+        vmname: VIC-LNX-01
+        ip: 172.16.20.11
+      mon-seconion-01:
+        vmname: MON-SECONION-01
+        ip: 172.16.30.10
+      mon-zeek-01:
+        vmname: MON-ZEEK-01
+        ip: 172.16.30.11
+      mon-suricata-01:
+        vmname: MON-SURICATA-01
+        ip: 172.16.30.12
+      mon-rita-01:
+        vmname: MON-RITA-01
+        ip: 172.16.30.13
+
+  tasks:
+    - name: Confirm targets
+      debug:
+        msg: "Creating snapshot '{{ snap_name }}' on: {{ vm_map.keys() | list | join(', ') }}"
+
+    # ── Power off cleanly ──
+    - name: Request graceful shutdown
+      command: >
+        "{{ vboxmanage }}" controlvm "{{ vm_map[item].vmname }}" acpipowerbutton
+      loop: "{{ vm_map.keys() | list }}"
+      ignore_errors: yes
+
+    - name: Wait for VMs to shut down
+      pause:
+        seconds: 30
+
+    - name: Assert all VMs are powered off
+      command: >
+        "{{ vboxmanage }}" showvminfo "{{ vm_map[item].vmname }}" --machinereadable
+      loop: "{{ vm_map.keys() | list }}"
+      register: vminfo_results
+      until: >-
+        vminfo_results.stdout is search('VMState="poweroff"') or
+        vminfo_results.stdout is search('VMState="saved"') or
+        vminfo_results.stdout is search('VMState="aborted"')
+      retries: 6
+      delay: 10
+      failed_when: >-
+        not (
+          vminfo_results.stdout is search('VMState="poweroff"') or
+          vminfo_results.stdout is search('VMState="saved"') or
+          vminfo_results.stdout is search('VMState="aborted"')
+        )
+
+    # ── Take snapshot ──
+    - name: Take snapshot
+      command: >
+        "{{ vboxmanage }}" snapshot "{{ vm_map[item].vmname }}"
+        take "{{ snap_name }}" --description "C2-Ready baseline for lab matrix runs"
+      loop: "{{ vm_map.keys() | list }}"
+      register: snap_results
+
+    - name: Report snapshot results
+      debug:
+        msg: "{{ item.item }}: snapshot '{{ snap_name }}' created"
+      loop: "{{ snap_results.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # ── Restart VMs ──
+    - name: Start VMs headless
+      command: >
+        "{{ vboxmanage }}" startvm "{{ vm_map[item].vmname }}" --type headless
+      loop: "{{ vm_map.keys() | list }}"
+
+    - name: "Wait {{ boot_wait }}s for VMs to initialize"
+      pause:
+        seconds: "{{ boot_wait }}"
+
+    - name: Wait for SSH connectivity
+      wait_for:
+        host: "{{ vm_map[item].ip }}"
+        port: 22
+        delay: 5
+        timeout: 60
+      loop: "{{ vm_map.keys() | list }}"
+      register: ssh_result
+      retries: 5
+      until: ssh_result is not failed
+
+    - name: Snapshot complete
+      debug:
+        msg: "Snapshot '{{ snap_name }}' created and VMs are SSH-ready"

@@ -1,0 +1,87 @@
+# ============================================================================
+# local-sliver.rules — Custom Suricata rules targeting Sliver C2 patterns
+# Phase 2 tuned configuration — ISE5901 Lab
+#
+# Tier A: Framework-specific IOC rules (known threat intel)
+# Tier B: Generic behavioral rules (catches customized variants)
+#
+# SID range: 9000100–9000199 (Sliver-specific)
+# ============================================================================
+
+# ── Tier A: Sliver-specific signatures ───────────────────────────────────────
+
+# A1 — Sliver default Chrome 106 user-agent (outdated, anomalous in 2026)
+alert http $HOME_NET any -> any any ( \
+    msg:"ISE5901 SLIVER Outdated Chrome 106 User-Agent"; \
+    flow:established,to_server; \
+    http.user_agent; content:"Chrome/106.0"; \
+    classtype:trojan-activity; \
+    sid:9000101; rev:1; \
+    metadata:created_at 2026_04_10, tier A, framework sliver; )
+
+# A2 — Sliver HTTP beacon POST+GET pair pattern
+#       Sliver uses paired POST/GET per callback cycle to randomized URIs
+alert http $HOME_NET any -> any 8080 ( \
+    msg:"ISE5901 SLIVER HTTP Beacon POST to Port 8080"; \
+    flow:established,to_server; \
+    http.method; content:"POST"; \
+    http.user_agent; content:"Chrome/106.0"; \
+    classtype:trojan-activity; \
+    sid:9000102; rev:1; \
+    metadata:created_at 2026_04_10, tier A, framework sliver; )
+
+# A3 — Sliver PNG-encoded payload in HTTP response
+#       Sliver encodes implant data as PNG images
+alert http any any -> $HOME_NET any ( \
+    msg:"ISE5901 SLIVER PNG Encoded Payload in HTTP Response"; \
+    flow:established,to_client; \
+    http.content_type; content:"image/png"; \
+    file_data; content:"|89 50 4E 47 0D 0A 1A 0A|"; depth:8; \
+    filesize:>5000; \
+    classtype:trojan-activity; \
+    sid:9000103; rev:1; \
+    metadata:created_at 2026_04_10, tier A, framework sliver; )
+
+# A4 — Sliver HTTPS beacon self-signed certificate
+alert tls $HOME_NET any -> any 443 ( \
+    msg:"ISE5901 SLIVER Possible HTTPS Beacon - Self-Signed Cert"; \
+    flow:established; \
+    tls.cert_subject; content:"CN="; \
+    tls.cert_issuer; content:"CN="; \
+    classtype:trojan-activity; \
+    sid:9000104; rev:1; \
+    metadata:created_at 2026_04_10, tier A, framework sliver; )
+
+# A5 — Sliver large implant download (EXE/ELF > 5MB via HTTP)
+alert http any any -> $HOME_NET any ( \
+    msg:"ISE5901 SLIVER Large Implant Download via HTTP"; \
+    flow:established,to_client; \
+    filesize:>5000000; \
+    classtype:trojan-activity; \
+    sid:9000105; rev:1; \
+    metadata:created_at 2026_04_10, tier A, framework sliver; )
+
+# ── Tier B: Generic behavioral rules ────────────────────────────────────────
+# NOTE: Tier B generic rules shared with Empire are in local-empire.rules
+#       (SIDs 9000010–9000011). They apply to both frameworks.
+
+# B3 — HTTP POST with encoded/binary body to non-standard port
+alert http $HOME_NET any -> any ![$HTTP_PORTS] ( \
+    msg:"ISE5901 GENERIC HTTP POST with Binary Body to Non-Standard Port"; \
+    flow:established,to_server; \
+    http.method; content:"POST"; \
+    http.content_type; content:"application/octet-stream"; \
+    classtype:trojan-activity; \
+    sid:9000110; rev:1; \
+    metadata:created_at 2026_04_10, tier B, framework generic; )
+
+# B4 — Repeated TLS connections to same IP with self-signed certs
+alert tls $HOME_NET any -> any any ( \
+    msg:"ISE5901 GENERIC Repeated TLS to Self-Signed Certificate"; \
+    flow:established; \
+    tls.cert_subject; content:"CN="; \
+    tls.cert_issuer; content:"CN="; \
+    threshold:type both, track by_src, count 5, seconds 600; \
+    classtype:trojan-activity; \
+    sid:9000111; rev:1; \
+    metadata:created_at 2026_04_10, tier B, framework generic; )

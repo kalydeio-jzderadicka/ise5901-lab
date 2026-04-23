@@ -1,0 +1,85 @@
+# ============================================================================
+# local-empire.rules — Custom Suricata rules targeting Empire C2 patterns
+# Phase 2 tuned configuration — ISE5901 Lab
+#
+# Tier A: Framework-specific IOC rules (known threat intel)
+# Tier B: Generic behavioral rules (catches customized variants)
+#
+# SID range: 9000001–9000099 (Empire-specific)
+# ============================================================================
+
+# ── Tier A: Empire-specific signatures ───────────────────────────────────────
+
+# A1 — Empire default HTTP beacon URI (POST /login/process.php)
+alert http $HOME_NET any -> any any ( \
+    msg:"ISE5901 EMPIRE HTTP Beacon - Default URI /login/process.php"; \
+    flow:established,to_server; \
+    http.method; content:"POST"; \
+    http.uri; content:"/login/process.php"; \
+    classtype:trojan-activity; \
+    sid:9000001; rev:1; \
+    metadata:created_at 2026_04_10, tier A, framework empire; )
+
+# A2 — Empire default stager URI (GET /news.php with session cookie)
+alert http $HOME_NET any -> any any ( \
+    msg:"ISE5901 EMPIRE Stager Request - /news.php with session cookie"; \
+    flow:established,to_server; \
+    http.uri; content:"/news.php"; \
+    http.cookie; content:"session="; \
+    classtype:trojan-activity; \
+    sid:9000002; rev:1; \
+    metadata:created_at 2026_04_10, tier A, framework empire; )
+
+# A3 — Empire PowerShell user-agent in HTTP traffic
+alert http $HOME_NET any -> any any ( \
+    msg:"ISE5901 EMPIRE PowerShell User-Agent in HTTP Request"; \
+    flow:established,to_server; \
+    http.user_agent; content:"WindowsPowerShell"; \
+    classtype:trojan-activity; \
+    sid:9000003; rev:1; \
+    metadata:created_at 2026_04_10, tier A, framework empire; )
+
+# A4 — Empire default HTTPS beacon (self-signed cert to non-standard port)
+#       Detects TLS connections to port 443 with generic self-signed CN
+alert tls $HOME_NET any -> any 443 ( \
+    msg:"ISE5901 EMPIRE Possible HTTPS Beacon - Self-Signed Cert"; \
+    flow:established; \
+    tls.cert_subject; content:"CN="; \
+    tls.cert_issuer; content:"CN="; \
+    classtype:trojan-activity; \
+    sid:9000004; rev:1; \
+    metadata:created_at 2026_04_10, tier A, framework empire; )
+
+# A5 — Empire stager delivery via Python SimpleHTTPServer
+#       Catches the initial payload download (GET *.bat or *.sh from port 9999)
+alert http any any -> $HOME_NET 9999 ( \
+    msg:"ISE5901 EMPIRE Stager Delivery via SimpleHTTPServer"; \
+    flow:established,to_server; \
+    http.method; content:"GET"; \
+    http.uri; pcre:"/\.(bat|sh)$/i"; \
+    classtype:trojan-activity; \
+    sid:9000005; rev:1; \
+    metadata:created_at 2026_04_10, tier A, framework empire; )
+
+# ── Tier B: Generic behavioral rules ────────────────────────────────────────
+
+# B1 — Periodic POST beaconing (any src hitting same dst ≥10 POSTs in 600s)
+#       Catches beacon patterns regardless of URI customization
+alert http $HOME_NET any -> any any ( \
+    msg:"ISE5901 GENERIC Periodic POST Beacon Activity"; \
+    flow:established,to_server; \
+    http.method; content:"POST"; \
+    threshold:type both, track by_src, count 10, seconds 600; \
+    classtype:trojan-activity; \
+    sid:9000010; rev:1; \
+    metadata:created_at 2026_04_10, tier B, framework generic; )
+
+# B2 — POST to non-standard HTTP port (8080) — common C2 pattern
+alert http $HOME_NET any -> any 8080 ( \
+    msg:"ISE5901 GENERIC HTTP POST to Port 8080"; \
+    flow:established,to_server; \
+    http.method; content:"POST"; \
+    threshold:type both, track by_src, count 5, seconds 600; \
+    classtype:trojan-activity; \
+    sid:9000011; rev:1; \
+    metadata:created_at 2026_04_10, tier B, framework generic; )

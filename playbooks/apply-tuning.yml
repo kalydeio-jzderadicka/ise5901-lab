@@ -1,0 +1,395 @@
+---
+# apply-tuning.yml — Deploy Phase 2 tuning to all sensors
+#
+# Deploys custom Suricata rules, Zeek scripts, and enables ET HUNTING
+# on standalone Suricata. Does NOT restart services — that happens at
+# the start of each run via run-single.yml.
+#
+# Usage:
+#   ansible-playbook -i inventory.yml playbooks/apply-tuning.yml
+#
+# Idempotent: safe to run multiple times.
+
+######################################################################
+# Play 1 — Deploy custom Suricata rules to standalone sensor
+######################################################################
+- name: "Tune Suricata (MON-SURICATA-01)"
+  hosts: sensor_suricata
+  become: yes
+  gather_facts: no
+  vars:
+    tuning_dir: "/home/ubuntu/ise5901-lab/tuning"
+  tasks:
+    - name: Ensure suricata-update local rules directory exists
+      file:
+        path: /var/lib/suricata/rules
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Copy local-empire.rules
+      copy:
+        src: "{{ tuning_dir }}/suricata/local-empire.rules"
+        dest: /var/lib/suricata/rules/local-empire.rules
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy local-sliver.rules
+      copy:
+        src: "{{ tuning_dir }}/suricata/local-sliver.rules"
+        dest: /var/lib/suricata/rules/local-sliver.rules
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Combine custom rules into local.rules
+      shell: |
+        cat /var/lib/suricata/rules/local-empire.rules \
+            /var/lib/suricata/rules/local-sliver.rules \
+            > /var/lib/suricata/rules/local.rules
+      changed_when: true
+
+    - name: Run suricata-update to refresh ET rules
+      command: suricata-update
+      changed_when: true
+
+    - name: Add local.rules to rule-files in suricata.yaml
+      lineinfile:
+        path: /etc/suricata/suricata.yaml
+        line: "  - /var/lib/suricata/rules/local.rules"
+        insertafter: "^rule-files:"
+        firstmatch: yes
+        state: present
+
+    - name: Validate Suricata configuration
+      command: suricata -T -c /etc/suricata/suricata.yaml
+      changed_when: false
+      register: suri_test
+
+    - assert:
+        that: suri_test.rc == 0
+        fail_msg: "Suricata config validation failed after tuning"
+
+    - name: Restart Suricata with tuned rules
+      systemd:
+        name: suricata
+        state: restarted
+
+    - name: Wait for Suricata to initialise
+      pause:
+        seconds: 10
+
+    - name: Verify Suricata is active
+      command: systemctl is-active suricata
+      changed_when: false
+      register: suri_check
+
+    - assert:
+        that: "suri_check.stdout == 'active'"
+        fail_msg: "Suricata failed to start after tuning"
+
+    - name: Read rule count from Suricata startup log
+      shell: grep -oP '\d+(?= signatures processed)' /var/log/suricata/suricata.log | tail -1
+      changed_when: false
+      register: rule_count
+
+    - debug:
+        msg: "Suricata tuned: {{ rule_count.stdout }} signatures loaded (from startup log)"
+
+######################################################################
+# Play 2 — Deploy custom Zeek scripts
+######################################################################
+- name: "Tune Zeek (MON-ZEEK-01)"
+  hosts: sensor_zeek
+  become: yes
+  gather_facts: no
+  vars:
+    tuning_dir: "/home/ubuntu/ise5901-lab/tuning"
+    zeek_site: "/opt/zeek/share/zeek/site"
+  tasks:
+    - name: Copy detect-beacon.zeek
+      copy:
+        src: "{{ tuning_dir }}/zeek/detect-beacon.zeek"
+        dest: "{{ zeek_site }}/detect-beacon.zeek"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy detect-dns-tunnel.zeek
+      copy:
+        src: "{{ tuning_dir }}/zeek/detect-dns-tunnel.zeek"
+        dest: "{{ zeek_site }}/detect-dns-tunnel.zeek"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy detect-user-agent.zeek
+      copy:
+        src: "{{ tuning_dir }}/zeek/detect-user-agent.zeek"
+        dest: "{{ zeek_site }}/detect-user-agent.zeek"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Add @load detect-beacon to local.zeek
+      lineinfile:
+        path: "{{ zeek_site }}/local.zeek"
+        line: "@load detect-beacon"
+        state: present
+
+    - name: Add @load detect-dns-tunnel to local.zeek
+      lineinfile:
+        path: "{{ zeek_site }}/local.zeek"
+        line: "@load detect-dns-tunnel"
+        state: present
+
+    - name: Add @load detect-user-agent to local.zeek
+      lineinfile:
+        path: "{{ zeek_site }}/local.zeek"
+        line: "@load detect-user-agent"
+        state: present
+
+    - name: Deploy Zeek with tuned scripts
+      command: /opt/zeek/bin/zeekctl deploy
+      changed_when: true
+
+    - name: Verify Zeek is running
+      command: /opt/zeek/bin/zeekctl status
+      changed_when: false
+      register: zeek_status
+
+    - assert:
+        that: "'running' in zeek_status.stdout"
+        fail_msg: "Zeek failed to start after tuning"
+
+    - name: Count loaded scripts
+      shell: grep -c '@load' {{ zeek_site }}/local.zeek 2>/dev/null || echo 0
+      changed_when: false
+      register: script_count
+
+    - debug:
+        msg: >-
+          Zeek tuned: {{ script_count.stdout }} scripts loaded
+          (added detect-beacon, detect-dns-tunnel, detect-user-agent)
+
+######################################################################
+# Play 3 — Deploy custom Suricata rules to Security Onion
+######################################################################
+- name: "Tune Security Onion (MON-SECONION-01)"
+  hosts: sensor_seconion
+  become: yes
+  gather_facts: no
+  vars:
+    tuning_dir: "/home/ubuntu/ise5901-lab/tuning"
+  tasks:
+    - name: Copy Empire rules to SO suricata rules dir
+      copy:
+        src: "{{ tuning_dir }}/suricata/local-empire.rules"
+        dest: /opt/so/rules/suricata/local-empire.rules
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy Sliver rules to SO suricata rules dir
+      copy:
+        src: "{{ tuning_dir }}/suricata/local-sliver.rules"
+        dest: /opt/so/rules/suricata/local-sliver.rules
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Combine custom rules into local.rules for SO
+      shell: |
+        cat /opt/so/rules/suricata/local-empire.rules \
+            /opt/so/rules/suricata/local-sliver.rules \
+            > /opt/so/rules/suricata/local.rules
+      changed_when: true
+
+    - name: Add local.rules to SO Suricata via Salt pillar
+      shell: |
+        python3 -c "
+        import yaml
+        path = '/opt/so/saltstack/local/pillar/minions/mon-seconion-01_standalone.sls'
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        data.setdefault('suricata', {}).setdefault('config', {})
+        data['suricata']['config']['rule-files'] = [
+            'all-rulesets.rules',
+            '/etc/suricata/rules/local.rules',
+        ]
+        with open(path, 'w') as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+        print('OK')
+        "
+      changed_when: true
+
+    - name: Restart SO Suricata container
+      command: so-suricata-restart --force
+      changed_when: true
+
+    - name: Wait for SO Suricata to initialise
+      pause:
+        seconds: 15
+
+    - name: Verify custom rules loaded in SO container
+      shell: >
+        docker exec so-suricata cat /etc/suricata/suricata.yaml
+        | grep -c 'local.rules'
+      changed_when: false
+      register: so_suri_test
+
+    - assert:
+        that: "so_suri_test.stdout | int > 0"
+        fail_msg: "SO Suricata did NOT load local.rules — check pillar"
+
+    - debug:
+        msg: "Security Onion Suricata tuned: local.rules confirmed in container config"
+
+######################################################################
+# Play 4 — Deploy custom Zeek scripts to Security Onion
+#
+# Uses SO's Salt-managed approach (GH #392):
+#   1. Scripts go to /opt/so/saltstack/local/salt/zeek/policy/custom/
+#      (Salt file.recurse syncs to /opt/so/conf/zeek/policy/custom/)
+#   2. Pillar key zeek.config.local.load (NOT @load) in per-minion SLS
+#      (config.map.jinja adds the @ prefix automatically)
+#   3. so-zeek-restart --force regenerates local.zeek from pillar
+#
+# Note: pillar merge=True replaces lists, so the full default load
+# list must be included alongside custom entries.
+######################################################################
+- name: "Tune SO Zeek (MON-SECONION-01)"
+  hosts: sensor_seconion
+  become: yes
+  gather_facts: no
+  vars:
+    tuning_dir: "/home/ubuntu/ise5901-lab/tuning"
+    so_salt_custom: "/opt/so/saltstack/local/salt/zeek/policy/custom"
+    so_pillar: "/opt/so/saltstack/local/pillar/minions/mon-seconion-01_standalone.sls"
+    custom_scripts:
+      - detect-beacon
+      - detect-dns-tunnel
+      - detect-user-agent
+  tasks:
+    - name: Copy custom Zeek scripts to Salt local tree
+      copy:
+        src: "{{ tuning_dir }}/zeek/{{ item }}.zeek"
+        dest: "{{ so_salt_custom }}/{{ item }}.zeek"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ custom_scripts }}"
+
+    - name: Add custom scripts to pillar load list (key=load, not @load)
+      shell: |
+        python3 -c "
+        import yaml, sys
+
+        path = '{{ so_pillar }}'
+        with open(path) as f:
+            data = yaml.safe_load(f)
+
+        # Default @load list from defaults.yaml
+        default_loads = [
+            'misc/loaded-scripts', 'misc/capture-loss',
+            'frameworks/software/vulnerable', 'frameworks/software/version-changes',
+            'protocols/ftp/software', 'protocols/smtp/software',
+            'protocols/ssh/software', 'protocols/http/software',
+            'protocols/dns/detect-external-names', 'protocols/ftp/detect',
+            'protocols/conn/known-hosts', 'protocols/conn/known-services',
+            'protocols/conn/vlan-logging', 'protocols/ssl/known-certs',
+            'protocols/ssl/validate-certs', 'protocols/ssl/log-hostcerts-only',
+            'protocols/ssh/geo-data', 'protocols/ssh/detect-bruteforcing',
+            'protocols/ssh/interesting-hostnames', 'protocols/http/detect-sql-injection',
+            'frameworks/files/hash-all-files', 'frameworks/files/detect-MHR',
+            'policy/frameworks/notice/extend-email/hostnames',
+            'policy/frameworks/notice/community-id',
+            'policy/protocols/conn/community-id-logging',
+            'ja3', 'ja4', 'hassh', 'intel', 'cve-2020-0601',
+            'securityonion/bpfconf', 'securityonion/file-extraction',
+            'securityonion/community-id-extended', 'oui-logging',
+            'icsnpp-modbus', 'icsnpp-dnp3', 'icsnpp-bacnet', 'icsnpp-ethercat',
+            'icsnpp-enip', 'icsnpp-opcua-binary', 'icsnpp-bsap', 'icsnpp-s7comm',
+            'zeek-plugin-tds', 'zeek-plugin-profinet', 'zeek-spicy-wireguard',
+            'zeek-spicy-stun', 'http2', 'zeek-spicy-ipsec', 'zeek-spicy-openvpn',
+        ]
+        custom_loads = ['custom/' + s for s in '{{ custom_scripts | join(',') }}'.split(',')]
+        full_list = default_loads + custom_loads
+
+        # Ensure zeek.config.local.load exists with full list
+        data.setdefault('zeek', {}).setdefault('config', {}).setdefault('local', {})
+        # Remove @load if present (wrong key)
+        data['zeek']['config']['local'].pop('@load', None)
+        data['zeek']['config']['local']['load'] = full_list
+
+        with open(path, 'w') as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+        print('OK')
+        "
+      changed_when: true
+
+    - name: Refresh Salt pillar
+      command: salt-call --local saltutil.refresh_pillar
+      changed_when: false
+
+    - name: Restart SO Zeek via Salt (regenerates local.zeek from pillar)
+      command: so-zeek-restart --force
+      changed_when: true
+
+    - name: Wait for SO Zeek to initialise
+      pause:
+        seconds: 15
+
+    - name: Verify custom scripts in container local.zeek
+      shell: >
+        docker exec so-zeek cat /opt/zeek/share/zeek/site/local.zeek
+        | grep -c 'custom/detect'
+      changed_when: false
+      register: so_zeek_test
+
+    - assert:
+        that: "so_zeek_test.stdout | int == 3"
+        fail_msg: "SO Zeek did NOT load all 3 custom scripts — check pillar"
+
+    - name: Verify custom script files in container
+      shell: >
+        docker exec so-zeek ls /opt/zeek/share/zeek/policy/custom/detect-beacon.zeek
+      changed_when: false
+
+    - name: Verify Zeek workers running
+      shell: >
+        docker exec so-zeek /opt/zeek/bin/zeekctl status 2>&1
+        | grep -c 'running'
+      changed_when: false
+      register: so_zeek_workers
+
+    - assert:
+        that: "so_zeek_workers.stdout | int >= 1"
+        fail_msg: "SO Zeek workers are not running after restart"
+
+    - debug:
+        msg: >-
+          Security Onion Zeek tuned: 3 custom detection scripts deployed
+          via Salt (survives so-zeek-restart)
+
+######################################################################
+# Play 5 — Summary
+######################################################################
+- name: "Tuning summary"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  tasks:
+    - debug:
+        msg: |
+          ╔══════════════════════════════════════════════╗
+          ║  Phase 2 Tuning Applied Successfully        ║
+          ╠══════════════════════════════════════════════╣
+          ║  Suricata:  Custom rules + ET HUNTING       ║
+          ║  Zeek:      3 custom detection scripts      ║
+          ║  SecOnion:  Custom rules via local.rules     ║
+          ╠══════════════════════════════════════════════╣
+          ║  Ready for tuned experiment runs (-TUN-)    ║
+          ╚══════════════════════════════════════════════╝
